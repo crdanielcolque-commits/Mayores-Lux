@@ -36,7 +36,6 @@ PNL_ESTRUCTURA = [
     {"Logica": "menos", "Concepto": "Rdo. Neto Gestoría", "Rubros": ["6-1", "6-2"], "Grupo": "Margen Bruto Gestión Comercial"},
     {"Logica": "igual", "Concepto": "Margen Bruto Gestión Comercial", "Rubros": [], "Grupo": "Margen Bruto Gestión Comercial"},
 
-    {"Logica": "menos", "Concepto": "Ajuste Costo de Reposición", "Rubros": [], "Grupo": "Margen Bruto Secundario"},
     {"Logica": "menos", "Concepto": "Costo Reacondic. y Acces.", "Rubros": ["5-2"], "Grupo": "Margen Bruto Secundario"},
     {"Logica": "igual", "Concepto": "Margen Bruto Primario", "Rubros": [], "Grupo": "Margen Bruto Secundario"},
     {"Logica": "mas", "Concepto": "Incentivos", "Rubros": ["4-3"], "Grupo": "Margen Bruto Secundario"},
@@ -106,6 +105,7 @@ PNL_ESTRUCTURA = [
     {"Logica": "igual", "Concepto": "Resultado después de Impuestos", "Rubros": [], "Grupo": "Resultado después de Impuestos"},
 ]
 
+
 # =========================
 # FUNCIONES
 # =========================
@@ -124,7 +124,6 @@ def limpiar_numero(x):
     s = s.replace(" ", "")
     s = s.replace("\xa0", "")
 
-    # Formato argentino: 1.234.567,89
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
@@ -132,16 +131,25 @@ def limpiar_numero(x):
 
     try:
         return float(s)
-    except:
+    except Exception:
         return 0.0
 
 
 def fmt_money(x):
     try:
         x = float(x)
-    except:
+    except Exception:
         x = 0
     return "$ {:,.0f}".format(x).replace(",", ".")
+
+
+def fmt_pct(x):
+    try:
+        if pd.isna(x):
+            return ""
+        return "{:.1%}".format(float(x))
+    except Exception:
+        return ""
 
 
 def normalizar_rubro(x):
@@ -156,7 +164,6 @@ def normalizar_rubro(x):
 @st.cache_data(ttl=600)
 def cargar_datos():
     df = pd.read_csv(CSV_URL)
-
     df.columns = [str(c).strip() for c in df.columns]
 
     if "Fecha" in df.columns:
@@ -184,26 +191,19 @@ def cargar_datos():
     else:
         df["Rubro_calc"] = ""
 
-    if "Sucursal" not in df.columns:
-        df["Sucursal"] = "Sin sucursal"
+    columnas_texto = [
+        "Sucursal", "Nombre cuenta", "Cuenta:", "Cuenta", "Nombre del rubro",
+        "Detalle", "des res", "Detalle 2", "Dpto", "Nro."
+    ]
 
-    if "Nombre cuenta" not in df.columns:
-        df["Nombre cuenta"] = ""
+    for col in columnas_texto:
+        if col not in df.columns:
+            df[col] = ""
 
     if "Cuenta:" not in df.columns and "Cuenta" in df.columns:
         df["Cuenta:"] = df["Cuenta"]
 
-    if "Cuenta:" not in df.columns:
-        df["Cuenta:"] = ""
-
-    if "Nombre del rubro" not in df.columns:
-        df["Nombre del rubro"] = ""
-
-    if "Detalle" not in df.columns:
-        df["Detalle"] = ""
-
-    if "des res" not in df.columns:
-        df["des res"] = ""
+    df["Sucursal"] = df["Sucursal"].fillna("Sin sucursal").astype(str)
 
     return df
 
@@ -233,9 +233,29 @@ def construir_pnl(df, campo_importe="Parcial"):
     return pd.DataFrame(filas)
 
 
+def mapa_rubro_a_pnl():
+    filas = []
+    for item in PNL_ESTRUCTURA:
+        for rubro in item["Rubros"]:
+            filas.append({
+                "Rubro_calc": rubro,
+                "Concepto_PNL": item["Concepto"],
+                "Grupo_PNL": item["Grupo"]
+            })
+    return pd.DataFrame(filas)
+
+
+def preparar_base_pnl(df):
+    mapa = mapa_rubro_a_pnl()
+    base = df.merge(mapa, on="Rubro_calc", how="left")
+    base["Grupo_PNL"] = base["Grupo_PNL"].fillna("Sin clasificar")
+    base["Concepto_PNL"] = base["Concepto_PNL"].fillna("Sin clasificar")
+    return base
+
+
 def aplicar_filtros(df):
     with st.sidebar:
-        st.header("Filtros")
+        st.header("Filtros generales")
 
         meses = sorted([m for m in df["Mes"].dropna().unique() if m != "NaT"])
         sucursales = sorted(df["Sucursal"].dropna().astype(str).unique())
@@ -244,7 +264,7 @@ def aplicar_filtros(df):
         suc_sel = st.multiselect("Sucursal", sucursales, default=sucursales)
 
         centro_sel = st.selectbox(
-            "Vista monetaria",
+            "Vista monetaria general",
             ["Parcial"] + [c for c in CENTROS_COSTO if c in df.columns]
         )
 
@@ -288,12 +308,13 @@ h2, h3 {
 </style>
 """, unsafe_allow_html=True)
 
+
 # =========================
 # APP
 # =========================
 
 st.title("📊 Dashboard Mayores Contables LUX")
-st.caption("Cuenta de resultados, centros de costo, sucursales y drilldown contable.")
+st.caption("Cuenta de resultados, centros de costo, sucursales, evolución mensual y drilldown contable.")
 
 try:
     df = cargar_datos()
@@ -307,16 +328,19 @@ if df.empty:
     st.stop()
 
 df_filtrado, campo_importe = aplicar_filtros(df)
+df_pnl = preparar_base_pnl(df_filtrado)
 pnl = construir_pnl(df_filtrado, campo_importe=campo_importe)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🏛️ Dirección",
     "📑 P&L",
     "💸 Costos",
     "🏢 Sucursales",
     "🧩 Centros de costo",
+    "📈 Desvíos mensuales",
     "🔎 Drilldown"
 ])
+
 
 # =========================
 # TAB 1 DIRECCIÓN
@@ -346,20 +370,15 @@ with tab1:
     with col1:
         st.markdown("### Evolución mensual")
         evo = df_filtrado.groupby("Mes", as_index=False)[campo_importe].sum()
-        if not evo.empty:
-            fig = px.line(evo, x="Mes", y=campo_importe, markers=True)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No hay datos para mostrar evolución.")
+        fig = px.line(evo, x="Mes", y=campo_importe, markers=True)
+        st.plotly_chart(fig, use_container_width=True)
 
     with col2:
         st.markdown("### Resultado por sucursal")
         suc = df_filtrado.groupby("Sucursal", as_index=False)[campo_importe].sum()
-        if not suc.empty:
-            fig = px.bar(suc, x="Sucursal", y=campo_importe)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No hay datos por sucursal.")
+        fig = px.bar(suc, x="Sucursal", y=campo_importe)
+        st.plotly_chart(fig, use_container_width=True)
+
 
 # =========================
 # TAB 2 P&L
@@ -368,30 +387,25 @@ with tab1:
 with tab2:
     st.subheader("P&L interactivo")
 
-    if pnl.empty:
-        st.warning("No hay datos para construir el P&L.")
-    else:
-        st.dataframe(
-            pnl[["Logica", "Grupo", "Concepto", "Rubros", "Importe_fmt"]],
-            use_container_width=True,
-            height=720
-        )
+    st.dataframe(
+        pnl[["Logica", "Grupo", "Concepto", "Rubros", "Importe_fmt"]],
+        use_container_width=True,
+        height=720
+    )
 
-        st.markdown("### Waterfall P&L")
-        pnl_detalle = pnl[pnl["Logica"].isin(["mas", "menos"])].copy()
+    st.markdown("### Aportes por concepto")
+    pnl_detalle = pnl[pnl["Logica"].isin(["mas", "menos"])].copy()
 
-        if not pnl_detalle.empty:
-            fig = px.bar(
-                pnl_detalle,
-                x="Concepto",
-                y="Importe",
-                color="Grupo",
-                title="Aportes por concepto"
-            )
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No hay conceptos con movimiento para graficar.")
+    fig = px.bar(
+        pnl_detalle,
+        x="Concepto",
+        y="Importe",
+        color="Grupo",
+        title="Aportes por concepto"
+    )
+    fig.update_layout(xaxis_tickangle=-45)
+    st.plotly_chart(fig, use_container_width=True)
+
 
 # =========================
 # TAB 3 COSTOS
@@ -400,33 +414,40 @@ with tab2:
 with tab3:
     st.subheader("Análisis de costos")
 
-    rubros_costos = []
-    for item in PNL_ESTRUCTURA:
-        if "Costo" in item["Grupo"] or "Controlables" in item["Grupo"] or "Egresos" in item["Grupo"]:
-            rubros_costos += item["Rubros"]
+    grupos_costos = [
+        "Costos Controlables",
+        "Costos No Controlables",
+        "Controlables de Estructura",
+        "Costos no Controlables de Estructura",
+        "Egresos Financieros",
+        "Otros Ingresos / Egresos"
+    ]
 
-    costos = df_filtrado[df_filtrado["Rubro_calc"].isin(rubros_costos)].copy()
+    costos = df_pnl[df_pnl["Grupo_PNL"].isin(grupos_costos)].copy()
 
     if costos.empty:
         st.info("No hay costos para los filtros seleccionados.")
     else:
-        costos_rubro = costos.groupby(["Rubro_calc", "Nombre del rubro"], as_index=False)[campo_importe].sum()
+        costos_rubro = costos.groupby(["Grupo_PNL", "Concepto_PNL", "Rubro_calc", "Nombre del rubro"], as_index=False)[campo_importe].sum()
         costos_rubro = costos_rubro.sort_values(campo_importe)
 
         fig = px.bar(
             costos_rubro,
             x=campo_importe,
-            y="Nombre del rubro",
+            y="Concepto_PNL",
+            color="Grupo_PNL",
             orientation="h",
-            title="Costos por rubro"
+            title="Costos por concepto"
         )
         st.plotly_chart(fig, use_container_width=True)
 
+        costos_rubro["Importe_fmt"] = costos_rubro[campo_importe].apply(fmt_money)
         st.dataframe(
-            costos_rubro,
+            costos_rubro[["Grupo_PNL", "Concepto_PNL", "Rubro_calc", "Nombre del rubro", "Importe_fmt"]],
             use_container_width=True,
             height=500
         )
+
 
 # =========================
 # TAB 4 SUCURSALES
@@ -438,18 +459,17 @@ with tab4:
     suc = df_filtrado.groupby("Sucursal", as_index=False)[campo_importe].sum()
     suc = suc.sort_values(campo_importe, ascending=False)
 
-    if suc.empty:
-        st.info("No hay datos por sucursal.")
-    else:
-        fig = px.bar(
-            suc,
-            x="Sucursal",
-            y=campo_importe,
-            title="Resultado por sucursal"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fig = px.bar(
+        suc,
+        x="Sucursal",
+        y=campo_importe,
+        title="Resultado por sucursal"
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        st.dataframe(suc, use_container_width=True)
+    suc["Importe_fmt"] = suc[campo_importe].apply(fmt_money)
+    st.dataframe(suc, use_container_width=True)
+
 
 # =========================
 # TAB 5 CENTROS DE COSTO
@@ -460,35 +480,224 @@ with tab5:
 
     centros_disponibles = [c for c in CENTROS_COSTO if c in df_filtrado.columns]
 
-    if not centros_disponibles:
-        st.warning("No se encontraron columnas de centros de costo.")
-    else:
-        resumen_centros = pd.DataFrame({
-            "Centro de costo": centros_disponibles,
-            "Importe": [df_filtrado[c].sum() for c in centros_disponibles]
-        })
+    resumen_centros = pd.DataFrame({
+        "Centro de costo": centros_disponibles,
+        "Importe": [df_filtrado[c].sum() for c in centros_disponibles]
+    })
 
-        resumen_centros = resumen_centros.sort_values("Importe", ascending=False)
-        resumen_centros["Importe_fmt"] = resumen_centros["Importe"].apply(fmt_money)
+    resumen_centros = resumen_centros.sort_values("Importe", ascending=False)
+    resumen_centros["Importe_fmt"] = resumen_centros["Importe"].apply(fmt_money)
 
-        fig = px.bar(
-            resumen_centros,
-            x="Centro de costo",
-            y="Importe",
-            title="Resultado por centro de costo"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fig = px.bar(
+        resumen_centros,
+        x="Centro de costo",
+        y="Importe",
+        title="Resultado por centro de costo"
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        st.dataframe(
-            resumen_centros[["Centro de costo", "Importe_fmt"]],
-            use_container_width=True
-        )
+    st.dataframe(
+        resumen_centros[["Centro de costo", "Importe_fmt"]],
+        use_container_width=True
+    )
+
 
 # =========================
-# TAB 6 DRILLDOWN
+# TAB 6 DESVÍOS MENSUALES
 # =========================
 
 with tab6:
+    st.subheader("📈 Desvíos mensuales por centro de costo")
+
+    centros_posventa = [c for c in ["Repuestos", "Tl. Mec.", "Mayorista", "ChapyPintu"] if c in df_pnl.columns]
+    centros_validos = centros_posventa if centros_posventa else [c for c in CENTROS_COSTO if c in df_pnl.columns]
+
+    colf1, colf2 = st.columns(2)
+
+    with colf1:
+        centro_analisis = st.selectbox(
+            "Centro de costo",
+            centros_validos,
+            index=0
+        )
+
+    grupos_disponibles = [
+        "Costos Controlables",
+        "Costos No Controlables",
+        "Controlables de Estructura",
+        "Costos no Controlables de Estructura",
+        "Egresos Financieros",
+        "Otros Ingresos / Egresos"
+    ]
+
+    with colf2:
+        grupos_sel = st.multiselect(
+            "Categorías a analizar",
+            grupos_disponibles,
+            default=["Costos Controlables", "Costos No Controlables"]
+        )
+
+    base_desvios = df_pnl[df_pnl["Grupo_PNL"].isin(grupos_sel)].copy()
+    base_desvios["Importe_CC"] = base_desvios[centro_analisis]
+
+    if base_desvios.empty:
+        st.info("No hay datos para los filtros seleccionados.")
+    else:
+        total_periodo = base_desvios["Importe_CC"].sum()
+
+        mensual_total = (
+            base_desvios.groupby("Mes", as_index=False)["Importe_CC"]
+            .sum()
+            .sort_values("Mes")
+        )
+
+        mensual_total["Mes_anterior"] = mensual_total["Importe_CC"].shift(1)
+        mensual_total["Variacion_$"] = mensual_total["Importe_CC"] - mensual_total["Mes_anterior"]
+        mensual_total["Variacion_%"] = np.where(
+            mensual_total["Mes_anterior"].abs() > 0,
+            mensual_total["Variacion_$"] / mensual_total["Mes_anterior"].abs(),
+            np.nan
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Centro analizado", centro_analisis)
+        c2.metric("Total período", fmt_money(total_periodo))
+
+        mayor_salto = mensual_total.dropna(subset=["Variacion_$"]).copy()
+        if not mayor_salto.empty:
+            mayor_salto["Impacto_abs"] = mayor_salto["Variacion_$"].abs()
+            fila_salto = mayor_salto.sort_values("Impacto_abs", ascending=False).iloc[0]
+            c3.metric(
+                "Mayor salto mensual",
+                fmt_money(fila_salto["Variacion_$"]),
+                f"{fila_salto['Mes']}"
+            )
+        else:
+            c3.metric("Mayor salto mensual", "Sin comparación")
+
+        st.markdown("### Evolución mensual de la categoría seleccionada")
+
+        fig = px.line(
+            mensual_total,
+            x="Mes",
+            y="Importe_CC",
+            markers=True,
+            title=f"Evolución mensual - {centro_analisis}"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        mensual_componentes = (
+            base_desvios.groupby(["Mes", "Grupo_PNL", "Concepto_PNL"], as_index=False)["Importe_CC"]
+            .sum()
+            .sort_values(["Grupo_PNL", "Concepto_PNL", "Mes"])
+        )
+
+        mensual_componentes["Mes_anterior"] = mensual_componentes.groupby(
+            ["Grupo_PNL", "Concepto_PNL"]
+        )["Importe_CC"].shift(1)
+
+        mensual_componentes["Variacion_$"] = mensual_componentes["Importe_CC"] - mensual_componentes["Mes_anterior"]
+
+        mensual_componentes["Variacion_%"] = np.where(
+            mensual_componentes["Mes_anterior"].abs() > 0,
+            mensual_componentes["Variacion_$"] / mensual_componentes["Mes_anterior"].abs(),
+            np.nan
+        )
+
+        ranking_desvios = mensual_componentes.dropna(subset=["Variacion_$"]).copy()
+        ranking_desvios["Impacto_abs"] = ranking_desvios["Variacion_$"].abs()
+        ranking_desvios = ranking_desvios.sort_values("Impacto_abs", ascending=False)
+
+        st.markdown("### Principales componentes que explican los desvíos")
+
+        if ranking_desvios.empty:
+            st.info("No hay meses suficientes para calcular variaciones.")
+        else:
+            top_desvios = ranking_desvios.head(15).copy()
+            top_desvios["Importe_fmt"] = top_desvios["Importe_CC"].apply(fmt_money)
+            top_desvios["Var_fmt"] = top_desvios["Variacion_$"].apply(fmt_money)
+            top_desvios["Var_%_fmt"] = top_desvios["Variacion_%"].apply(fmt_pct)
+
+            fig = px.bar(
+                top_desvios,
+                x="Variacion_$",
+                y="Concepto_PNL",
+                color="Grupo_PNL",
+                orientation="h",
+                title="Top desvíos mensuales por componente"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(
+                top_desvios[[
+                    "Mes",
+                    "Grupo_PNL",
+                    "Concepto_PNL",
+                    "Importe_fmt",
+                    "Var_fmt",
+                    "Var_%_fmt"
+                ]],
+                use_container_width=True,
+                height=420
+            )
+
+            st.markdown("### Lectura ejecutiva automática")
+
+            principal = top_desvios.iloc[0]
+            st.info(
+                f"El principal desvío detectado corresponde a **{principal['Concepto_PNL']}** "
+                f"en el mes **{principal['Mes']}**, dentro del grupo **{principal['Grupo_PNL']}**. "
+                f"La variación mensual fue de **{fmt_money(principal['Variacion_$'])}**. "
+                f"Este componente debería revisarse primero porque es el mayor salto absoluto del período filtrado."
+            )
+
+        st.markdown("### Movimientos contables atípicos que pueden explicar el salto")
+
+        movimientos = base_desvios.copy()
+        movimientos["Impacto_abs"] = movimientos["Importe_CC"].abs()
+        movimientos = movimientos.sort_values("Impacto_abs", ascending=False)
+
+        columnas_mov = [
+            "Fecha",
+            "Mes",
+            "Sucursal",
+            "Cuenta:",
+            "Nombre cuenta",
+            "Rubro_calc",
+            "Nombre del rubro",
+            "Grupo_PNL",
+            "Concepto_PNL",
+            "Detalle",
+            "des res",
+            centro_analisis
+        ]
+
+        columnas_mov = [c for c in columnas_mov if c in movimientos.columns]
+
+        movimientos_top = movimientos.head(30).copy()
+        movimientos_top["Importe_CC_fmt"] = movimientos_top[centro_analisis].apply(fmt_money)
+
+        columnas_mostrar = [c for c in columnas_mov if c != centro_analisis] + ["Importe_CC_fmt"]
+
+        st.dataframe(
+            movimientos_top[columnas_mostrar],
+            use_container_width=True,
+            height=520
+        )
+
+        st.download_button(
+            label="⬇️ Descargar análisis de desvíos",
+            data=base_desvios.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"desvios_{centro_analisis}.csv",
+            mime="text/csv"
+        )
+
+
+# =========================
+# TAB 7 DRILLDOWN
+# =========================
+
+with tab7:
     st.subheader("Drilldown contable")
 
     columnas_drill = [
@@ -514,7 +723,7 @@ with tab6:
 
     if buscar:
         texto = buscar.lower()
-        mask = False
+        mask = pd.Series(False, index=drill.index)
         for col in ["Nombre cuenta", "Detalle", "des res", "Nombre del rubro"]:
             if col in drill.columns:
                 mask = mask | drill[col].astype(str).str.lower().str.contains(texto, na=False)
