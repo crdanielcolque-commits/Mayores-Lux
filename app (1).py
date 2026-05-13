@@ -773,3 +773,305 @@ with tab5:
         file_name="drilldown_mayores_lux.csv",
         mime="text/csv"
     )
+# =========================
+# TAB PROVEEDORES
+# =========================
+
+import re
+
+def extraer_factura(texto):
+    if pd.isna(texto):
+        return ""
+
+    texto = str(texto)
+
+    patrones = [
+        r'(F[A-Z]\s?\d{4}[- ]?\d{4,8})',
+        r'([A-Z]{1,2}\d{4}[- ]\d{4,8})',
+        r'(\d{4}[- ]\d{8})'
+    ]
+
+    for patron in patrones:
+        match = re.search(patron, texto)
+        if match:
+            return match.group(1)
+
+    return ""
+
+
+def extraer_proveedor(row):
+
+    textos = []
+
+    for col in ["Detalle 2", "des res", "Detalle"]:
+        if col in row and pd.notna(row[col]):
+            textos.append(str(row[col]))
+
+    texto = " ".join(textos).upper()
+
+    basura = [
+        "FACTURA",
+        "RECIBO",
+        "NC",
+        "ND",
+        "FC",
+        "FA",
+        "FB",
+        "COMPRA",
+        "PAGO"
+    ]
+
+    proveedor = texto
+
+    for b in basura:
+        proveedor = proveedor.replace(b, "")
+
+    proveedor = re.sub(r'\d+', ' ', proveedor)
+    proveedor = re.sub(r'[-_/]', ' ', proveedor)
+    proveedor = re.sub(r'\s+', ' ', proveedor)
+
+    proveedor = proveedor.strip()
+
+    palabras = proveedor.split(" ")
+
+    palabras = [p for p in palabras if len(p) > 2]
+
+    proveedor = " ".join(palabras[:4])
+
+    if proveedor == "":
+        proveedor = "SIN IDENTIFICAR"
+
+    return proveedor
+
+
+df_filtrado["Factura_detectada"] = (
+    df_filtrado["Detalle"].astype(str).apply(extraer_factura)
+)
+
+df_filtrado["Proveedor_detectado"] = (
+    df_filtrado.apply(extraer_proveedor, axis=1)
+)
+
+tab_prov = st.tabs(["🏭 Proveedores"])[0]
+
+with tab_prov:
+
+    st.subheader("🏭 Análisis de proveedores")
+
+    colp1, colp2 = st.columns(2)
+
+    with colp1:
+        centro_prov = st.selectbox(
+            "Centro de costo",
+            [c for c in CENTROS_COSTO if f"{c}_Gestion" in df_filtrado.columns],
+            index=3
+        )
+
+    with colp2:
+        categoria_prov = st.multiselect(
+            "Categoría",
+            [
+                "Costos Controlables",
+                "Costos No Controlables"
+            ],
+            default=[
+                "Costos Controlables",
+                "Costos No Controlables"
+            ]
+        )
+
+    campo_prov = f"{centro_prov}_Gestion"
+
+    base_prov = df_filtrado[
+        df_filtrado["Grupo_PNL"].isin(categoria_prov)
+    ].copy()
+
+    base_prov["Importe_Prov"] = base_prov[campo_prov]
+
+    base_prov = base_prov[
+        base_prov["Importe_Prov"] != 0
+    ]
+
+    prov_mes = (
+        base_prov.groupby(
+            ["Mes", "Proveedor_detectado"],
+            as_index=False
+        )["Importe_Prov"]
+        .sum()
+    )
+
+    ranking = (
+        prov_mes.groupby(
+            "Proveedor_detectado",
+            as_index=False
+        )["Importe_Prov"]
+        .sum()
+        .sort_values("Importe_Prov", ascending=False)
+        .head(20)
+    )
+
+    ranking["Importe_fmt"] = ranking["Importe_Prov"].apply(fmt_money)
+
+    st.markdown("### Top proveedores")
+
+    fig = px.bar(
+        ranking,
+        x="Proveedor_detectado",
+        y="Importe_Prov",
+        title="Top proveedores por gasto"
+    )
+
+    fig.update_layout(
+        xaxis_tickangle=-45
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        ranking[
+            [
+                "Proveedor_detectado",
+                "Importe_fmt"
+            ]
+        ],
+        use_container_width=True
+    )
+
+    st.markdown("### Evolución mensual")
+
+    top10 = ranking[
+        "Proveedor_detectado"
+    ].head(10).tolist()
+
+    evo = prov_mes[
+        prov_mes["Proveedor_detectado"].isin(top10)
+    ]
+
+    fig2 = px.line(
+        evo,
+        x="Mes",
+        y="Importe_Prov",
+        color="Proveedor_detectado",
+        markers=True,
+        title="Evolución mensual proveedores"
+    )
+
+    st.plotly_chart(fig2, use_container_width=True)
+
+    st.markdown("### Variaciones detectadas")
+
+    pivot = prov_mes.pivot_table(
+        index="Proveedor_detectado",
+        columns="Mes",
+        values="Importe_Prov",
+        aggfunc="sum",
+        fill_value=0
+    ).reset_index()
+
+    meses_cols = [
+        c for c in pivot.columns
+        if c != "Proveedor_detectado"
+    ]
+
+    meses_cols = sorted(meses_cols)
+
+    if len(meses_cols) >= 2:
+
+        mes_ant = meses_cols[-2]
+        mes_act = meses_cols[-1]
+
+        pivot["Variacion"] = (
+            pivot[mes_act] - pivot[mes_ant]
+        )
+
+        pivot["Variacion_%"] = np.where(
+            pivot[mes_ant].abs() > 0,
+            pivot["Variacion"] / pivot[mes_ant].abs(),
+            np.nan
+        )
+
+        pivot = pivot.sort_values(
+            "Variacion",
+            ascending=False
+        )
+
+        pivot["Mes anterior"] = pivot[
+            mes_ant
+        ].apply(fmt_money)
+
+        pivot["Mes actual"] = pivot[
+            mes_act
+        ].apply(fmt_money)
+
+        pivot["Variación"] = pivot[
+            "Variacion"
+        ].apply(fmt_money)
+
+        pivot["Variación %"] = pivot[
+            "Variacion_%"
+        ].apply(fmt_pct)
+
+        st.dataframe(
+            pivot[
+                [
+                    "Proveedor_detectado",
+                    "Mes anterior",
+                    "Mes actual",
+                    "Variación",
+                    "Variación %"
+                ]
+            ].head(30),
+            use_container_width=True,
+            height=500
+        )
+
+    st.markdown("### Movimientos asociados")
+
+    proveedor_sel = st.selectbox(
+        "Proveedor",
+        sorted(
+            base_prov["Proveedor_detectado"]
+            .dropna()
+            .unique()
+        )
+    )
+
+    movs = base_prov[
+        base_prov["Proveedor_detectado"]
+        == proveedor_sel
+    ].copy()
+
+    movs = movs.sort_values(
+        "Importe_Prov",
+        ascending=False
+    )
+
+    movs["Importe_fmt"] = (
+        movs["Importe_Prov"]
+        .apply(fmt_money)
+    )
+
+    columnas_mov = [
+        "Mes",
+        "Fecha",
+        "Sucursal",
+        "Factura_detectada",
+        "Proveedor_detectado",
+        "Nombre del rubro",
+        "Concepto_PNL",
+        "Detalle",
+        "des res",
+        "Detalle 2",
+        "Importe_fmt"
+    ]
+
+    columnas_mov = [
+        c for c in columnas_mov
+        if c in movs.columns
+    ]
+
+    st.dataframe(
+        movs[columnas_mov].head(100),
+        use_container_width=True,
+        height=550
+    )
