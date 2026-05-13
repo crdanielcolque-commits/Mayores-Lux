@@ -29,6 +29,57 @@ CENTROS_COSTO = [
     "Administr."
 ]
 
+SIGNO_RUBRO = {
+    "VENTAS": "-",
+    "INCENTIVOS": "-",
+    "COMIS. P/VTA DIRECTA": "-",
+    "INGRESO EXTRAORDIN": "-",
+    "OTROS ING FINANCIERO": "-",
+    "INGRESOS SEGUROS": "-",
+    "COMIS CONSIGNACIONES": "-",
+    "SOBRANTES DE INV.": "-",
+
+    "INTERESES IMPOSITIVO": "+",
+    "MERMAS DE INVENTARIO": "+",
+    "GTOS GESTIO JUDICIAL": "+",
+    "COMISION CHANGO CAR": "+",
+    "UTILES Y MAT. DE OFI": "+",
+    "Adm Ctral (No Usar)": "+",
+    "COMIS. A VENDEDORES": "+",
+    "SUELDOS ADM. Y CS.SS": "+",
+    "SEGUROS": "+",
+    "SUELDOS ADM CENTRAL": "+",
+    "GTOS ATENCION CLIENT": "+",
+    "UTILES Y MAT DE OFIC": "+",
+    "EGRESO EXTRAORDINARI": "+",
+    "TELEFONO E INTERNET": "+",
+    "MANT. RODADOS": "+",
+    "IMPUESTOS Y TASAS": "+",
+    "OTROS GTOS FIJOS": "+",
+    "PREPARAC. Y PREENTRE": "+",
+    "SEGURIDAD Y VIGILANC": "+",
+    "HERRAM. MAT. Y FLETE": "+",
+    "EGRESOS GESTORIA": "+",
+    "MOVILIDAD Y VIATICOS": "+",
+    "ALQUILERES": "+",
+    "LUZ,AGUA Y GAS": "+",
+    "HONORARIOS PROFESION": "+",
+    "Serv. Limpieza": "+",
+    "PUBLICIDAD Y PROMOC.": "+",
+    "COSTO DE REAC. Y ACC": "+",
+    "MANTENIM. BS. DE USO": "+",
+    "SERV LUZ.TEL.SUSCRIP": "+",
+    "COM. Y GTOS BANCARIO": "+",
+    "INGRESOS GESTORIA": "+",
+    "SS. GRAT. Y CS. INT.": "+",
+    "AMORTIZACIONES": "+",
+    "OTROS EGR. FINANCIER": "+",
+    "IMPUESTOS FINANCIAC": "+",
+    "INT. FINANC. VEHICUL": "+",
+    "DESCUENTOS S/ VTAS.": "+",
+    "COSTO DE VENTAS": "+"
+}
+
 PNL_ESTRUCTURA = [
     {"Logica": "mas", "Concepto": "Ventas", "Rubros": ["4-1"], "Grupo": "Margen Bruto Gestión Comercial"},
     {"Logica": "menos", "Concepto": "Descuentos sobre ventas", "Rubros": ["4-2"], "Grupo": "Margen Bruto Gestión Comercial"},
@@ -135,6 +186,12 @@ def limpiar_numero(x):
         return 0.0
 
 
+def limpiar_texto(x):
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
 def fmt_money(x):
     try:
         x = float(x)
@@ -159,6 +216,20 @@ def normalizar_rubro(x):
     s = s.replace(".0", "")
     s = s.replace(" ", "")
     return s
+
+
+def signo_factor_por_rubro(nombre_rubro):
+    nombre = limpiar_texto(nombre_rubro)
+
+    if nombre in SIGNO_RUBRO:
+        signo = SIGNO_RUBRO[nombre]
+    else:
+        signo = "+"
+
+    # Si el mayor trae el rubro con signo contable negativo,
+    # para gestión lo convertimos a magnitud positiva.
+    # Si trae signo positivo, también trabajamos como magnitud positiva.
+    return -1 if signo == "-" else 1
 
 
 @st.cache_data(ttl=600)
@@ -204,30 +275,60 @@ def cargar_datos():
         df["Cuenta:"] = df["Cuenta"]
 
     df["Sucursal"] = df["Sucursal"].fillna("Sin sucursal").astype(str)
+    df["Nombre del rubro"] = df["Nombre del rubro"].apply(limpiar_texto)
+
+    df["Signo_rubro"] = df["Nombre del rubro"].map(SIGNO_RUBRO).fillna("+")
+    df["Factor_signo"] = df["Nombre del rubro"].apply(signo_factor_por_rubro)
+
+    # Columnas corregidas para gestión.
+    # Estas convierten ingresos que vienen negativos en positivos para gestión.
+    # Luego el P&L aplica la lógica mas/menos.
+    df["Parcial_Gestion"] = df["Parcial"] * df["Factor_signo"]
+
+    for col in CENTROS_COSTO:
+        df[f"{col}_Gestion"] = df[col] * df["Factor_signo"]
 
     return df
 
 
-def construir_pnl(df, campo_importe="Parcial"):
+def campo_gestion(campo):
+    if campo == "Parcial":
+        return "Parcial_Gestion"
+    if campo in CENTROS_COSTO:
+        return f"{campo}_Gestion"
+    return campo
+
+
+def construir_pnl(df, campo_importe="Parcial_Gestion"):
     filas = []
     acumulado = 0.0
 
     for item in PNL_ESTRUCTURA:
         rubros = item["Rubros"]
+        logica = item["Logica"]
 
         if rubros:
-            importe = df.loc[df["Rubro_calc"].isin(rubros), campo_importe].sum()
-            acumulado += importe
+            importe_bruto = df.loc[df["Rubro_calc"].isin(rubros), campo_importe].sum()
+
+            if logica == "menos":
+                importe_resultado = -abs(importe_bruto)
+            elif logica == "mas":
+                importe_resultado = abs(importe_bruto)
+            else:
+                importe_resultado = importe_bruto
+
+            acumulado += importe_resultado
+            importe_mostrar = importe_resultado
         else:
-            importe = acumulado
+            importe_mostrar = acumulado
 
         filas.append({
             "Logica": item["Logica"],
             "Grupo": item["Grupo"],
             "Concepto": item["Concepto"],
             "Rubros": " + ".join(rubros),
-            "Importe": importe,
-            "Importe_fmt": fmt_money(importe)
+            "Importe": importe_mostrar,
+            "Importe_fmt": fmt_money(importe_mostrar)
         })
 
     return pd.DataFrame(filas)
@@ -240,7 +341,8 @@ def mapa_rubro_a_pnl():
             filas.append({
                 "Rubro_calc": rubro,
                 "Concepto_PNL": item["Concepto"],
-                "Grupo_PNL": item["Grupo"]
+                "Grupo_PNL": item["Grupo"],
+                "Logica_PNL": item["Logica"]
             })
     return pd.DataFrame(filas)
 
@@ -250,6 +352,7 @@ def preparar_base_pnl(df):
     base = df.merge(mapa, on="Rubro_calc", how="left")
     base["Grupo_PNL"] = base["Grupo_PNL"].fillna("Sin clasificar")
     base["Concepto_PNL"] = base["Concepto_PNL"].fillna("Sin clasificar")
+    base["Logica_PNL"] = base["Logica_PNL"].fillna("sin lógica")
     return base
 
 
@@ -327,17 +430,20 @@ if df.empty:
     st.warning("La base está vacía o no pudo leerse correctamente.")
     st.stop()
 
-df_filtrado, campo_importe = aplicar_filtros(df)
+df_filtrado, campo_importe_original = aplicar_filtros(df)
+campo_importe = campo_gestion(campo_importe_original)
+
 df_pnl = preparar_base_pnl(df_filtrado)
 pnl = construir_pnl(df_filtrado, campo_importe=campo_importe)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🏛️ Dirección",
     "📑 P&L",
     "💸 Costos",
     "🏢 Sucursales",
     "🧩 Centros de costo",
     "📈 Desvíos mensuales",
+    "🧾 Control signos",
     "🔎 Drilldown"
 ])
 
@@ -349,7 +455,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 with tab1:
     st.subheader("Resumen ejecutivo")
 
-    ventas = df_filtrado.loc[df_filtrado["Rubro_calc"].isin(["4-1"]), campo_importe].sum()
+    ventas = pnl.loc[pnl["Concepto"] == "Ventas", "Importe"].sum()
     utilidad_bruta = pnl.loc[pnl["Concepto"] == "Utilidad Bruta", "Importe"].sum()
     utilidad_operativa = pnl.loc[pnl["Concepto"] == "Utilidad Operativa", "Importe"].sum()
     resultado_final = pnl.loc[pnl["Concepto"] == "Resultado después de Impuestos", "Importe"].sum()
@@ -428,8 +534,13 @@ with tab3:
     if costos.empty:
         st.info("No hay costos para los filtros seleccionados.")
     else:
-        costos_rubro = costos.groupby(["Grupo_PNL", "Concepto_PNL", "Rubro_calc", "Nombre del rubro"], as_index=False)[campo_importe].sum()
+        costos_rubro = costos.groupby(
+            ["Grupo_PNL", "Concepto_PNL", "Rubro_calc", "Nombre del rubro"],
+            as_index=False
+        )[campo_importe].sum()
+
         costos_rubro = costos_rubro.sort_values(campo_importe)
+        costos_rubro["Importe_fmt"] = costos_rubro[campo_importe].apply(fmt_money)
 
         fig = px.bar(
             costos_rubro,
@@ -441,7 +552,6 @@ with tab3:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        costos_rubro["Importe_fmt"] = costos_rubro[campo_importe].apply(fmt_money)
         st.dataframe(
             costos_rubro[["Grupo_PNL", "Concepto_PNL", "Rubro_calc", "Nombre del rubro", "Importe_fmt"]],
             use_container_width=True,
@@ -458,6 +568,7 @@ with tab4:
 
     suc = df_filtrado.groupby("Sucursal", as_index=False)[campo_importe].sum()
     suc = suc.sort_values(campo_importe, ascending=False)
+    suc["Importe_fmt"] = suc[campo_importe].apply(fmt_money)
 
     fig = px.bar(
         suc,
@@ -467,7 +578,6 @@ with tab4:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    suc["Importe_fmt"] = suc[campo_importe].apply(fmt_money)
     st.dataframe(suc, use_container_width=True)
 
 
@@ -478,11 +588,11 @@ with tab4:
 with tab5:
     st.subheader("Análisis por centros de costo")
 
-    centros_disponibles = [c for c in CENTROS_COSTO if c in df_filtrado.columns]
+    centros_disponibles = [c for c in CENTROS_COSTO if f"{c}_Gestion" in df_filtrado.columns]
 
     resumen_centros = pd.DataFrame({
         "Centro de costo": centros_disponibles,
-        "Importe": [df_filtrado[c].sum() for c in centros_disponibles]
+        "Importe": [df_filtrado[f"{c}_Gestion"].sum() for c in centros_disponibles]
     })
 
     resumen_centros = resumen_centros.sort_values("Importe", ascending=False)
@@ -509,8 +619,8 @@ with tab5:
 with tab6:
     st.subheader("📈 Desvíos mensuales por centro de costo")
 
-    centros_posventa = [c for c in ["Repuestos", "Tl. Mec.", "Mayorista", "ChapyPintu"] if c in df_pnl.columns]
-    centros_validos = centros_posventa if centros_posventa else [c for c in CENTROS_COSTO if c in df_pnl.columns]
+    centros_posventa = [c for c in ["Repuestos", "Tl. Mec.", "Mayorista", "ChapyPintu"] if f"{c}_Gestion" in df_pnl.columns]
+    centros_validos = centros_posventa if centros_posventa else [c for c in CENTROS_COSTO if f"{c}_Gestion" in df_pnl.columns]
 
     colf1, colf2 = st.columns(2)
 
@@ -537,8 +647,10 @@ with tab6:
             default=["Costos Controlables", "Costos No Controlables"]
         )
 
+    campo_cc = f"{centro_analisis}_Gestion"
+
     base_desvios = df_pnl[df_pnl["Grupo_PNL"].isin(grupos_sel)].copy()
-    base_desvios["Importe_CC"] = base_desvios[centro_analisis]
+    base_desvios["Importe_CC"] = base_desvios[campo_cc]
 
     if base_desvios.empty:
         st.info("No hay datos para los filtros seleccionados.")
@@ -641,8 +753,6 @@ with tab6:
                 height=420
             )
 
-            st.markdown("### Lectura ejecutiva automática")
-
             principal = top_desvios.iloc[0]
             st.info(
                 f"El principal desvío detectado corresponde a **{principal['Concepto_PNL']}** "
@@ -669,15 +779,15 @@ with tab6:
             "Concepto_PNL",
             "Detalle",
             "des res",
-            centro_analisis
+            campo_cc
         ]
 
         columnas_mov = [c for c in columnas_mov if c in movimientos.columns]
 
         movimientos_top = movimientos.head(30).copy()
-        movimientos_top["Importe_CC_fmt"] = movimientos_top[centro_analisis].apply(fmt_money)
+        movimientos_top["Importe_CC_fmt"] = movimientos_top[campo_cc].apply(fmt_money)
 
-        columnas_mostrar = [c for c in columnas_mov if c != centro_analisis] + ["Importe_CC_fmt"]
+        columnas_mostrar = [c for c in columnas_mov if c != campo_cc] + ["Importe_CC_fmt"]
 
         st.dataframe(
             movimientos_top[columnas_mostrar],
@@ -694,10 +804,43 @@ with tab6:
 
 
 # =========================
-# TAB 7 DRILLDOWN
+# TAB 7 CONTROL SIGNOS
 # =========================
 
 with tab7:
+    st.subheader("🧾 Control de signos por rubro")
+
+    control = (
+        df_filtrado.groupby(["Nombre del rubro", "Signo_rubro"], as_index=False)
+        .agg(
+            Parcial_original=("Parcial", "sum"),
+            Parcial_gestion=("Parcial_Gestion", "sum")
+        )
+        .sort_values("Nombre del rubro")
+    )
+
+    control["Parcial_original_fmt"] = control["Parcial_original"].apply(fmt_money)
+    control["Parcial_gestion_fmt"] = control["Parcial_gestion"].apply(fmt_money)
+
+    st.dataframe(
+        control[[
+            "Nombre del rubro",
+            "Signo_rubro",
+            "Parcial_original_fmt",
+            "Parcial_gestion_fmt"
+        ]],
+        use_container_width=True,
+        height=650
+    )
+
+    st.caption("Parcial original = signo tal como viene del mayor. Parcial gestión = importe normalizado para construir el P&L.")
+
+
+# =========================
+# TAB 8 DRILLDOWN
+# =========================
+
+with tab8:
     st.subheader("Drilldown contable")
 
     columnas_drill = [
@@ -708,11 +851,13 @@ with tab7:
         "Nombre cuenta",
         "Rubro_calc",
         "Nombre del rubro",
+        "Signo_rubro",
         "Detalle",
         "des res",
         "Debe",
         "Haber",
-        "Parcial"
+        "Parcial",
+        "Parcial_Gestion"
     ]
 
     columnas_drill = [c for c in columnas_drill if c in df_filtrado.columns]
@@ -729,8 +874,16 @@ with tab7:
                 mask = mask | drill[col].astype(str).str.lower().str.contains(texto, na=False)
         drill = drill[mask]
 
+    drill_mostrar = drill[columnas_drill].copy()
+
+    if "Parcial" in drill_mostrar.columns:
+        drill_mostrar["Parcial_fmt"] = drill_mostrar["Parcial"].apply(fmt_money)
+
+    if "Parcial_Gestion" in drill_mostrar.columns:
+        drill_mostrar["Parcial_Gestion_fmt"] = drill_mostrar["Parcial_Gestion"].apply(fmt_money)
+
     st.dataframe(
-        drill[columnas_drill],
+        drill_mostrar,
         use_container_width=True,
         height=650
     )
