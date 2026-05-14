@@ -599,6 +599,50 @@ def styled_heatmap_percent(df_num):
     pct = df_num.abs().div(row_totals, axis=0)
 
     df_display = df_num.copy().astype(str)
+
+    for idx in df_num.index:
+        for col in df_num.columns:
+            val = df_num.loc[idx, col]
+            p = pct.loc[idx, col]
+
+            if pd.isna(p):
+                df_display.loc[idx, col] = f"{fmt_money(val)} (0,0%)"
+            else:
+                df_display.loc[idx, col] = f"{fmt_money(val)} ({p:.1%})"
+
+    def color_cell(v):
+        try:
+            p = float(
+                str(v)
+                .split("(")[1]
+                .replace("%)", "")
+                .replace(",", ".")
+            ) / 100
+        except Exception:
+            p = 0
+
+        if p >= 0.50:
+            return "background-color: #ffb3b3; color: #111;"
+        elif p >= 0.30:
+            return "background-color: #ffd6a5; color: #111;"
+        elif p >= 0.15:
+            return "background-color: #fff3b0; color: #111;"
+        elif p > 0:
+            return "background-color: #d8f3dc; color: #111;"
+        else:
+            return "background-color: #f5f5f5; color: #777;"
+
+    styler = df_display.style
+
+    # Compatible con versiones nuevas y viejas de pandas
+    if hasattr(styler, "map"):
+        return styler.map(color_cell)
+    else:
+        return styler.applymap(color_cell)
+    row_totals = df_num.abs().sum(axis=1).replace(0, np.nan)
+    pct = df_num.abs().div(row_totals, axis=0)
+
+    df_display = df_num.copy().astype(str)
     for idx in df_num.index:
         for col in df_num.columns:
             val = df_num.loc[idx, col]
