@@ -312,7 +312,7 @@ df_filtrado = df[df["Sucursal"].isin(suc_sel)].copy() if suc_sel else df.copy()
 meses_all = sorted(df_filtrado["Mes"].dropna().unique())
 centros_base = centros_disponibles(df_filtrado)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["🎯 Control de Costos", "🚨 Alertas & Insights", "🏭 Proveedores", "🏢 Benchmark Sucursales", "📑 P&L", "📒 Cuentas contables", "🧾 Control signos", "🔎 Drilldown", "⚙️ Diccionario"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(["🎯 Control de Costos", "🚨 Alertas & Insights", "💼 Reducción de Gastos", "🏭 Proveedores", "🏢 Benchmark Sucursales", "📑 P&L", "📒 Cuentas contables", "🧾 Control signos", "🔎 Drilldown", "⚙️ Diccionario"])
 
 with tab1:
     st.subheader("🎯 Control de costos controlables y no controlables")
@@ -383,6 +383,219 @@ with tab2:
         if not insights: st.success("No se detectan insights relevantes con los filtros actuales.")
 
 with tab3:
+    st.subheader("💼 Comité de Reducción de Gastos")
+    st.caption("Vista ejecutiva para identificar rubros, sucursales y proveedores con mayor oportunidad de eficiencia.")
+
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        centros_red = st.multiselect(
+            "Centro de costo",
+            centros_base,
+            default=default_centros(centros_base, "posventa"),
+            key="centros_reduccion"
+        )
+    with r2:
+        grupos_red = st.multiselect(
+            "Tipo de costo",
+            ["Costos Controlables", "Costos No Controlables"],
+            default=["Costos Controlables", "Costos No Controlables"],
+            key="grupos_reduccion"
+        )
+    with r3:
+        meses_red = st.multiselect(
+            "Meses a analizar",
+            meses_all,
+            default=meses_all[-4:],
+            key="meses_reduccion"
+        )
+
+    base_red = preparar_costos(df_filtrado, centros_red, grupos_red, meses_red)
+
+    if base_red.empty:
+        st.info("No hay datos para los filtros seleccionados.")
+    else:
+        meses_red_ord = sorted(base_red["Mes"].dropna().unique())
+        mes_act = meses_red_ord[-1]
+        mes_ant = meses_red_ord[-2] if len(meses_red_ord) >= 2 else None
+
+        total_gasto = base_red["Importe_CC"].sum()
+        total_actual = base_red.loc[base_red["Mes"] == mes_act, "Importe_CC"].sum()
+        total_anterior = base_red.loc[base_red["Mes"] == mes_ant, "Importe_CC"].sum() if mes_ant else np.nan
+        var_total = total_actual - total_anterior if mes_ant else np.nan
+        var_pct = var_total / abs(total_anterior) if mes_ant and total_anterior != 0 else np.nan
+
+        # Rubros y proveedores principales
+        por_concepto_total = base_red.groupby(["Grupo_PNL", "Concepto_PNL"], as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False)
+        por_proveedor_total = base_red.groupby(["Proveedor_detectado", "Categoria_proveedor"], as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False)
+        por_sucursal_total = base_red.groupby("Sucursal", as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False)
+
+        top_rubro = por_concepto_total.iloc[0]["Concepto_PNL"] if not por_concepto_total.empty else "Sin datos"
+        top_proveedor = por_proveedor_total.iloc[0]["Proveedor_detectado"] if not por_proveedor_total.empty else "Sin datos"
+        top_sucursal = por_sucursal_total.iloc[0]["Sucursal"] if not por_sucursal_total.empty else "Sin datos"
+
+        # Estimación simple de oportunidad: rubros controlables/negociables con mayor presión
+        reducibles_inmediatos = [
+            "Publicidad y Promoción", "Movilidad y Viáticos", "Útiles y materiales de oficina",
+            "Teléfonos e internet", "Serv. Limpieza", "Herramientas, materiales y fletes",
+            "Otros Gastos Fijos", "Gastos de Atención clientes", "Mantenimiento rodados y equipos",
+            "Mantenimiento Bienes de Uso", "Seguridad y vigilancia"
+        ]
+        negociables = ["Alquileres", "Honorarios profesionales", "Seguros", "Fuerza motriz, luz, agua y gas"]
+
+        matriz_base = tabla_variaciones(base_red, ["Grupo_PNL", "Concepto_PNL"])
+        matriz_base["Controlabilidad"] = np.select(
+            [
+                matriz_base["Concepto_PNL"].isin(reducibles_inmediatos),
+                matriz_base["Concepto_PNL"].isin(negociables),
+                matriz_base["Grupo_PNL"].eq("Costos No Controlables")
+            ],
+            ["Alta", "Media / negociable", "Baja"],
+            default="Media"
+        )
+        matriz_base["Acción sugerida"] = np.select(
+            [
+                matriz_base["Controlabilidad"].eq("Alta"),
+                matriz_base["Controlabilidad"].eq("Media / negociable"),
+                matriz_base["Controlabilidad"].eq("Baja")
+            ],
+            [
+                "Revisar consumo, necesidad y autorización del gasto",
+                "Renegociar contrato / validar condiciones",
+                "Monitorear, validar imputación y buscar optimización indirecta"
+            ],
+            default="Analizar caso puntual"
+        )
+        matriz_base["Ahorro potencial 10%"] = np.where(
+            matriz_base["Controlabilidad"].isin(["Alta", "Media", "Media / negociable"]),
+            matriz_base["Mes actual"].abs() * 0.10,
+            0
+        )
+        ahorro_potencial = matriz_base["Ahorro potencial 10%"].sum()
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Gasto analizado", fmt_money(total_gasto))
+        k2.metric(f"Gasto {mes_act}", fmt_money(total_actual))
+        k3.metric("Variación vs mes anterior", fmt_money(var_total), fmt_pct(var_pct))
+        k4.metric("Ahorro potencial 10%", fmt_money(ahorro_potencial))
+        k5.metric("Sucursal foco", top_sucursal)
+
+        st.markdown("### 1. Mapa ejecutivo de oportunidad")
+        matriz = matriz_base.copy()
+        matriz["Prioridad"] = np.select(
+            [
+                matriz["Severidad"].isin(["🔴 Crítico", "🟠 Alto"]) & matriz["Controlabilidad"].isin(["Alta", "Media", "Media / negociable"]),
+                matriz["Severidad"].isin(["🟡 Medio"]) & matriz["Controlabilidad"].isin(["Alta", "Media", "Media / negociable"]),
+                matriz["Controlabilidad"].eq("Baja")
+            ],
+            ["🔴 Prioridad alta", "🟡 Prioridad media", "⚪ Baja controlabilidad"],
+            default="🟢 Monitorear"
+        )
+
+        matriz_mostrar = matriz.copy()
+        for col in ["Mes anterior", "Mes actual", "Variación $", "Ahorro potencial 10%"]:
+            matriz_mostrar[col] = matriz_mostrar[col].apply(fmt_money)
+        matriz_mostrar["Variación %"] = matriz_mostrar["Variación %"].apply(fmt_pct)
+
+        st.dataframe(
+            matriz_mostrar[[
+                "Prioridad", "Grupo_PNL", "Concepto_PNL", "Controlabilidad",
+                "Mes anterior", "Mes actual", "Variación $", "Variación %",
+                "Ahorro potencial 10%", "Severidad", "Motivo severidad", "Acción sugerida"
+            ]],
+            use_container_width=True,
+            height=430
+        )
+
+        st.markdown("### 2. Rubros con mayor consumo y presión")
+        top_rubros = matriz.sort_values("Mes actual", ascending=False).head(12).copy()
+        top_rubros["Etiqueta"] = top_rubros["Mes actual"].apply(fmt_money_short)
+        fig_r = px.bar(
+            top_rubros,
+            x="Mes actual",
+            y="Concepto_PNL",
+            color="Grupo_PNL",
+            text="Etiqueta",
+            orientation="h",
+            title="Rubros con mayor gasto actual"
+        )
+        preparar_para_labels(fig_r)
+        st.plotly_chart(fig_r, use_container_width=True)
+
+        st.markdown("### 3. Proveedores con mayor representación")
+        top_prov = por_proveedor_total.head(15).copy()
+        top_prov["Participación"] = np.where(total_gasto != 0, top_prov["Importe_CC"] / abs(total_gasto), 0)
+        top_prov["Importe"] = top_prov["Importe_CC"].apply(fmt_money)
+        top_prov["Participación %"] = top_prov["Participación"].apply(fmt_pct)
+        top_prov["Etiqueta"] = top_prov["Importe_CC"].apply(fmt_money_short)
+        fig_p = px.bar(
+            top_prov,
+            x="Importe_CC",
+            y="Proveedor_detectado",
+            color="Categoria_proveedor",
+            text="Etiqueta",
+            orientation="h",
+            title="Top proveedores por gasto total analizado"
+        )
+        preparar_para_labels(fig_p)
+        st.plotly_chart(fig_p, use_container_width=True)
+        st.dataframe(top_prov[["Proveedor_detectado", "Categoria_proveedor", "Importe", "Participación %"]], use_container_width=True, height=360)
+
+        st.markdown("### 4. Apertura por sucursal")
+        suc_concepto = base_red.groupby(["Sucursal", "Concepto_PNL"], as_index=False)["Importe_CC"].sum()
+        heat_suc = suc_concepto.pivot_table(index="Concepto_PNL", columns="Sucursal", values="Importe_CC", aggfunc="sum", fill_value=0)
+        st.dataframe(styled_heatmap_percent(heat_suc), use_container_width=True, height=420)
+
+        st.markdown("### 5. Plan de acción sugerido para comité")
+        acciones = matriz[matriz["Prioridad"].isin(["🔴 Prioridad alta", "🟡 Prioridad media"])].copy()
+        acciones = acciones.sort_values(["Prioridad", "Ahorro potencial 10%"], ascending=[True, False]).head(15)
+        acciones_m = acciones.copy()
+        for col in ["Mes actual", "Variación $", "Ahorro potencial 10%"]:
+            acciones_m[col] = acciones_m[col].apply(fmt_money)
+        acciones_m["Variación %"] = acciones_m["Variación %"].apply(fmt_pct)
+        st.dataframe(
+            acciones_m[[
+                "Prioridad", "Concepto_PNL", "Grupo_PNL", "Controlabilidad", "Mes actual",
+                "Variación $", "Variación %", "Ahorro potencial 10%", "Acción sugerida"
+            ]],
+            use_container_width=True,
+            height=360
+        )
+
+        st.markdown("### 6. Insight para presentar a dirección")
+        insight = []
+        if not pd.isna(var_total):
+            if var_total > 0:
+                insight.append(f"🔴 En **{label_centros(centros_red)}**, el gasto aumentó **{fmt_money(var_total)}** versus el mes anterior (**{fmt_pct(var_pct)}**).")
+            elif var_total < 0:
+                insight.append(f"🟢 En **{label_centros(centros_red)}**, el gasto bajó **{fmt_money(abs(var_total))}** versus el mes anterior (**{fmt_pct(var_pct)}**).")
+        insight.append(f"El rubro de mayor consumo es **{top_rubro}** y el proveedor con mayor representación es **{top_proveedor}**.")
+        if ahorro_potencial > 0:
+            insight.append(f"Si se trabajara una reducción selectiva del 10% sobre rubros controlables/negociables, el ahorro potencial estimado sería de **{fmt_money(ahorro_potencial)}** para el período analizado.")
+        insight.append("La recomendación no es aplicar un recorte lineal, sino priorizar rubros con alta controlabilidad, alta severidad y concentración por proveedor/sucursal.")
+        st.info(" ".join(insight))
+
+        st.markdown("### 7. Drilldown de rubro/proveedor")
+        coldr1, coldr2 = st.columns(2)
+        with coldr1:
+            rubro_sel = st.selectbox("Rubro para revisar", sorted(base_red["Concepto_PNL"].dropna().unique()), key="rubro_reduccion")
+        with coldr2:
+            provs_rubro = sorted(base_red.loc[base_red["Concepto_PNL"] == rubro_sel, "Proveedor_detectado"].dropna().unique())
+            prov_sel = st.selectbox("Proveedor", ["Todos"] + provs_rubro, key="prov_reduccion")
+        mov_red = base_red[base_red["Concepto_PNL"] == rubro_sel].copy()
+        if prov_sel != "Todos":
+            mov_red = mov_red[mov_red["Proveedor_detectado"] == prov_sel]
+        mov_red["Importe"] = mov_red["Importe_CC"].apply(fmt_money)
+        mov_red["Impacto_abs"] = mov_red["Importe_CC"].abs()
+        mov_red = mov_red.sort_values("Impacto_abs", ascending=False)
+        cols_red = [
+            "Mes", "Fecha", "Sucursal", "Cuenta:", "Nombre cuenta", "Nombre del rubro",
+            "Concepto_PNL", "Proveedor_detectado", "Factura_detectada",
+            "Detalle", "des res", "Detalle 2", "Importe"
+        ]
+        st.dataframe(mov_red[[c for c in cols_red if c in mov_red.columns]].head(200), use_container_width=True, height=520)
+
+
+with tab4:
     st.subheader("🏭 Análisis de proveedores")
     p1,p2,p3=st.columns(3)
     with p1: centros_p=st.multiselect("Centro de costo", centros_base, default=default_centros(centros_base,"repuestos"), key="centros_prov")
@@ -424,7 +637,7 @@ with tab3:
             cols=["Mes","Fecha","Sucursal","Factura_detectada","Proveedor_detectado","Categoria_proveedor","Nombre del rubro","Concepto_PNL","Detalle","des res","Detalle 2","Importe"]
             st.dataframe(mov[[c for c in cols if c in mov.columns]].head(150), use_container_width=True, height=520)
 
-with tab4:
+with tab5:
     st.subheader("🏢 Benchmark de costos entre sucursales")
     centros_b=st.multiselect("Centro de costo", centros_base, default=default_centros(centros_base,"repuestos"), key="centros_bench")
     grupos_b=st.multiselect("Categoría", ["Costos Controlables","Costos No Controlables"], default=["Costos Controlables"], key="grupo_bench")
@@ -441,7 +654,7 @@ with tab4:
         topc=base_b[base_b["Sucursal"]==mayor["Sucursal"]].groupby("Concepto_PNL",as_index=False)["Importe_CC"].sum().sort_values("Importe_CC",ascending=False).head(3); ctxt=", ".join([f"{r['Concepto_PNL']} ({fmt_money(r['Importe_CC'])})" for _,r in topc.iterrows()])
         st.info(f"🧠 **{mayor['Sucursal']}** concentra **{fmt_pct(part)}** del costo total en **{label_centros(centros_b)}**, con **{fmt_money(mayor['Costo total'])}**. La menor es **{menor['Sucursal']}** con **{fmt_money(menor['Costo total'])}**. Principales conceptos: **{ctxt}**. ✅ Revisar escala operativa, contratos, consumos o imputaciones.")
 
-with tab5:
+with tab6:
     st.subheader("📑 P&L mensual interactivo")
     meses_pnl=st.multiselect("Meses a mostrar", meses_all, default=meses_all[-4:])
     if not meses_pnl: st.warning("Seleccioná al menos un mes.")
@@ -457,7 +670,7 @@ with tab5:
                 for col in meses_pnl+["Acumulado"]: mg[col]=mg[col].apply(fmt_money)
                 st.dataframe(mg, use_container_width=True, height=350)
 
-with tab6:
+with tab7:
     st.subheader("📒 Evolución por cuenta contable")
     col1,col2,col3=st.columns(3)
     with col1: centros_cta=st.multiselect("Centro de costo", centros_base, default=default_centros(centros_base,"repuestos"), key="centros_cuentas")
@@ -492,12 +705,12 @@ with tab6:
         st.dataframe(mov[[c for c in cols if c in mov.columns]].head(150), use_container_width=True, height=520)
         st.download_button("⬇️ Descargar evolución por cuenta contable", data=tabla.to_csv(index=False).encode("utf-8-sig"), file_name=f"evolucion_cuentas_{label_centros(centros_cta)}.csv", mime="text/csv")
 
-with tab7:
+with tab8:
     st.subheader("🧾 Control de signos")
     control=df_filtrado.groupby(["Nombre del rubro","Signo_rubro"],as_index=False).agg(Parcial_original=("Parcial","sum"),Parcial_gestion=("Parcial_Gestion","sum")); control["Parcial original"]=control["Parcial_original"].apply(fmt_money); control["Parcial gestión"]=control["Parcial_gestion"].apply(fmt_money)
     st.dataframe(control[["Nombre del rubro","Signo_rubro","Parcial original","Parcial gestión"]], use_container_width=True, height=650)
 
-with tab8:
+with tab9:
     st.subheader("🔎 Drilldown contable")
     buscar=st.text_input("Buscar por cuenta, proveedor, factura, detalle, descripción o rubro")
     drill=df_filtrado.copy()
@@ -516,7 +729,7 @@ with tab8:
     st.dataframe(dm[[c for c in cols if c in dm.columns]], use_container_width=True, height=650)
     st.download_button("⬇️ Descargar drilldown filtrado", data=drill.to_csv(index=False).encode("utf-8-sig"), file_name="drilldown_mayores_lux.csv", mime="text/csv")
 
-with tab9:
+with tab10:
     st.subheader("⚙️ Diccionario y reglas del modelo")
     st.markdown("""
 ### 1. Lógica principal
