@@ -181,6 +181,18 @@ def preparar_para_labels(fig):
     fig.update_layout(uniformtext_minsize=8, uniformtext_mode="hide")
     return fig
 
+
+def ordenar_categorias_por_total(df, categoria_col, valor_col):
+    if df.empty or categoria_col not in df.columns or valor_col not in df.columns:
+        return []
+    return (
+        df.groupby(categoria_col, as_index=False)[valor_col]
+        .sum()
+        .sort_values(valor_col, ascending=False)[categoria_col]
+        .astype(str)
+        .tolist()
+    )
+
 def centros_disponibles(df): return list(dict.fromkeys([x for x in CENTROS_POSVENTA + CENTROS_COSTO if f"{x}_Gestion" in df.columns]))
 def default_centros(disponibles, modo="repuestos"):
     if modo == "posventa":
@@ -527,6 +539,7 @@ with tab3:
         top_prov["Importe"] = top_prov["Importe_CC"].apply(fmt_money)
         top_prov["Participación %"] = top_prov["Participación"].apply(fmt_pct)
         top_prov["Etiqueta"] = top_prov["Importe_CC"].apply(fmt_money_short)
+        orden_proveedores_red = ordenar_categorias_por_total(top_prov, "Proveedor_detectado", "Importe_CC")
         fig_p = px.bar(
             top_prov,
             x="Importe_CC",
@@ -534,7 +547,8 @@ with tab3:
             color="Categoria_proveedor",
             text="Etiqueta",
             orientation="h",
-            title="Top proveedores por gasto total analizado"
+            title="Top proveedores por gasto total analizado",
+            category_orders={"Proveedor_detectado": orden_proveedores_red[::-1]}
         )
         preparar_para_labels(fig_p)
         st.plotly_chart(fig_p, use_container_width=True)
@@ -608,7 +622,19 @@ with tab4:
         ranking_total=prov_mes.groupby(["Proveedor_detectado","Categoria_proveedor"], as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False)
         stacked=prov_mes[prov_mes["Proveedor_detectado"].isin(ranking_total.head(15)["Proveedor_detectado"].tolist())].copy(); stacked["Etiqueta"]=stacked.apply(lambda r:f"{r['Mes']}: {fmt_money_short(r['Importe_CC'])}", axis=1)
         st.markdown("### Top proveedores por costo — apertura mensual")
-        fig=px.bar(stacked,x="Proveedor_detectado",y="Importe_CC",color="Mes",text="Etiqueta",title=f"Top proveedores por gasto, dividido por mes - {label_centros(centros_p)}"); fig.update_layout(xaxis_tickangle=-45); fig.update_traces(textposition="inside",insidetextanchor="middle"); st.plotly_chart(fig,use_container_width=True)
+        orden_proveedores = ordenar_categorias_por_total(stacked, "Proveedor_detectado", "Importe_CC")
+        fig=px.bar(
+            stacked,
+            x="Proveedor_detectado",
+            y="Importe_CC",
+            color="Mes",
+            text="Etiqueta",
+            title=f"Top proveedores por gasto, dividido por mes - {label_centros(centros_p)}",
+            category_orders={"Proveedor_detectado": orden_proveedores}
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+        fig.update_traces(textposition="inside",insidetextanchor="middle")
+        st.plotly_chart(fig,use_container_width=True)
         st.markdown("### Tabla mensual por proveedor")
         tabla=prov_mes.pivot_table(index=["Proveedor_detectado","Categoria_proveedor"],columns="Mes",values="Importe_CC",aggfunc="sum",fill_value=0).reset_index(); meses_cols=sorted([c for c in tabla.columns if c not in ["Proveedor_detectado","Categoria_proveedor"]])
         tabla["Total"]=tabla[meses_cols].sum(axis=1); tabla["Promedio mensual"]=tabla[meses_cols].mean(axis=1); tabla["Mes pico"]=tabla[meses_cols].idxmax(axis=1); tabla["Importe mes pico"]=tabla[meses_cols].max(axis=1); tabla["% concentración pico"]=np.where(tabla["Total"].abs()>0,tabla["Importe mes pico"]/tabla["Total"].abs(),0); tabla=tabla.sort_values("Total",ascending=False)
