@@ -324,7 +324,7 @@ df_filtrado = df[df["Sucursal"].isin(suc_sel)].copy() if suc_sel else df.copy()
 meses_all = sorted(df_filtrado["Mes"].dropna().unique())
 centros_base = centros_disponibles(df_filtrado)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(["🎯 Control de Costos", "🚨 Alertas & Insights", "💼 Reducción de Gastos", "🏭 Proveedores", "🏢 Benchmark Sucursales", "📑 P&L", "📒 Cuentas contables", "🧾 Control signos", "🔎 Drilldown", "⚙️ Diccionario"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["🎯 Control de Costos", "🚨 Alertas & Insights", "💼 Reducción de Gastos", "💰 Oportunidades de Ahorro", "🏭 Proveedores", "🏢 Benchmark Sucursales", "📑 P&L", "📒 Cuentas contables", "🧾 Control signos", "🔎 Drilldown", "⚙️ Diccionario"])
 
 with tab1:
     st.subheader("🎯 Control de costos controlables y no controlables")
@@ -609,7 +609,260 @@ with tab3:
         st.dataframe(mov_red[[c for c in cols_red if c in mov_red.columns]].head(200), use_container_width=True, height=520)
 
 
+
 with tab4:
+    st.subheader("💰 Oportunidades de Ahorro")
+    st.caption("Vista ejecutiva para separar gasto alto de gasto accionable y priorizar acciones concretas de reducción.")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        centros_opp = st.multiselect(
+            "Centro de costo",
+            centros_base,
+            default=default_centros(centros_base, "posventa"),
+            key="centros_oportunidades"
+        )
+    with col2:
+        grupos_opp = st.multiselect(
+            "Tipo de costo",
+            ["Costos Controlables", "Costos No Controlables"],
+            default=["Costos Controlables", "Costos No Controlables"],
+            key="grupos_oportunidades"
+        )
+    with col3:
+        meses_opp = st.multiselect(
+            "Meses a analizar",
+            meses_all,
+            default=meses_all[-4:],
+            key="meses_oportunidades"
+        )
+
+    base_opp = preparar_costos(df_filtrado, centros_opp, grupos_opp, meses_opp)
+
+    if base_opp.empty:
+        st.info("No hay datos para los filtros seleccionados.")
+    else:
+        st.markdown("### 1. Reglas de accionabilidad")
+        st.caption("El objetivo no es mirar solo el gasto más alto, sino separar lo no negociable de lo realmente trabajable.")
+
+        proveedores_baja = ["ROQUE JUAN LOZANO", "TOYOTA ENTINA", "TOYOTA ARGENTINA", "OVERSOFT"]
+        categorias_baja = ["Toyota / terminal", "Sistemas / software", "Alquileres"]
+        conceptos_baja = ["Alquileres", "Recupero de Gastos Toyota", "Amortizaciones"]
+        conceptos_media = [
+            "Fuerza motriz, luz, agua y gas", "Seguridad y vigilancia", "Honorarios profesionales",
+            "Seguros", "Impuestos", "Impuestos y tasas", "Teléfonos e internet"
+        ]
+        conceptos_alta = [
+            "Publicidad y Promoción", "Movilidad y Viáticos", "Útiles y materiales de oficina",
+            "Serv. Limpieza", "Herramientas, materiales y fletes", "Otros Gastos Fijos",
+            "Gastos de Atención clientes", "Mantenimiento rodados y equipos",
+            "Mantenimiento Bienes de Uso", "Preparación y entrega", "Servicios gratuitos y Cargos internos"
+        ]
+
+        base_opp["Proveedor_detectado"] = base_opp["Proveedor_detectado"].fillna("SIN IDENTIFICAR")
+        base_opp["Categoria_proveedor"] = base_opp["Categoria_proveedor"].fillna("Otros / no clasificado")
+
+        def clasificar_accionabilidad(row):
+            proveedor = str(row.get("Proveedor_detectado", "")).upper()
+            concepto = str(row.get("Concepto_PNL", ""))
+            categoria = str(row.get("Categoria_proveedor", ""))
+            if any(p in proveedor for p in proveedores_baja) or categoria in categorias_baja or concepto in conceptos_baja:
+                return "Baja"
+            if concepto in conceptos_alta:
+                return "Alta"
+            if concepto in conceptos_media:
+                return "Media"
+            if row.get("Grupo_PNL") == "Costos Controlables":
+                return "Media"
+            return "Baja"
+
+        def accion_sugerida(row):
+            acc = row.get("Accionabilidad", "")
+            concepto = str(row.get("Concepto_PNL", ""))
+            categoria = str(row.get("Categoria_proveedor", ""))
+            if acc == "Alta":
+                if "Publicidad" in concepto:
+                    return "Revisar pauta, objetivo, ROAS y necesidad del gasto."
+                if "Viáticos" in concepto or "Movilidad" in concepto:
+                    return "Definir política de autorización, topes y rendición por motivo."
+                if "Limpieza" in concepto or categoria == "Limpieza / seguridad":
+                    return "Cotizar alternativa, renegociar frecuencia y alcance del servicio."
+                if "Herramientas" in concepto or "Útiles" in concepto:
+                    return "Centralizar compras, consolidar pedidos y comparar proveedores."
+                return "Revisar necesidad, autorización, frecuencia y proveedor alternativo."
+            if acc == "Media":
+                if "energ" in concepto.lower() or "luz" in concepto.lower():
+                    return "Continuar plan LED/interruptores y medir consumo por sede."
+                if "Seguridad" in concepto:
+                    return "Revisar dotación, horarios cubiertos y condiciones contractuales."
+                if "Honorarios" in concepto:
+                    return "Validar alcance, duplicidades y posibilidad de fee fijo."
+                return "Renegociar condiciones, validar contrato y controlar recurrencia."
+            return "Baja acción directa: monitorear, validar imputación y evitar crecimiento no justificado."
+
+        base_opp["Accionabilidad"] = base_opp.apply(clasificar_accionabilidad, axis=1)
+        base_opp["% ahorro estimado"] = np.select(
+            [base_opp["Accionabilidad"].eq("Alta"), base_opp["Accionabilidad"].eq("Media")],
+            [0.10, 0.05],
+            default=0.00
+        )
+        base_opp["Ahorro potencial"] = base_opp["Importe_CC"].abs() * base_opp["% ahorro estimado"]
+
+        excluir_baja = st.checkbox(
+            "Excluir del análisis principal proveedores/rubros de baja accionabilidad: Roque Lozano, Toyota, Oversoft, alquileres y licencias",
+            value=True,
+            key="excluir_baja_oportunidades"
+        )
+        base_acc = base_opp[base_opp["Accionabilidad"].ne("Baja")].copy() if excluir_baja else base_opp.copy()
+
+        total_gasto = base_opp["Importe_CC"].sum()
+        gasto_accionable = base_acc["Importe_CC"].sum()
+        ahorro_potencial = base_acc["Ahorro potencial"].sum()
+        pct_accionable = gasto_accionable / total_gasto if total_gasto else np.nan
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Gasto total analizado", fmt_money(total_gasto))
+        k2.metric("Gasto accionable", fmt_money(gasto_accionable), fmt_pct(pct_accionable))
+        k3.metric("Ahorro potencial estimado", fmt_money(ahorro_potencial))
+        k4.metric("Proveedores accionables", base_acc["Proveedor_detectado"].nunique())
+        k5.metric("Rubros accionables", base_acc["Concepto_PNL"].nunique())
+
+        st.info(
+            "Lectura ejecutiva: este tab separa gastos estructurales o poco negociables de los gastos con margen real de gestión. "
+            "La estimación es conservadora: 10% sobre gastos de alta accionabilidad y 5% sobre gastos de accionabilidad media."
+        )
+
+        if base_acc.empty:
+            st.warning("Con la exclusión activa no quedan gastos accionables para analizar. Desactivá el check para ver todo el gasto.")
+        else:
+            st.markdown("### 2. Ranking de oportunidades por rubro")
+            rubros = base_acc.groupby(["Grupo_PNL", "Concepto_PNL", "Accionabilidad"], as_index=False).agg(
+                Gasto=("Importe_CC", "sum"),
+                Ahorro_potencial=("Ahorro potencial", "sum"),
+                Movimientos=("Importe_CC", "count"),
+                Proveedores=("Proveedor_detectado", "nunique")
+            ).sort_values("Ahorro_potencial", ascending=False)
+            rubros["Etiqueta"] = rubros["Ahorro_potencial"].apply(fmt_money_short)
+            fig = px.bar(
+                rubros.head(15),
+                x="Ahorro_potencial",
+                y="Concepto_PNL",
+                color="Accionabilidad",
+                text="Etiqueta",
+                orientation="h",
+                title="Top rubros por ahorro potencial estimado"
+            )
+            preparar_para_labels(fig)
+            st.plotly_chart(fig, use_container_width=True)
+            rubros_m = rubros.copy()
+            rubros_m["Gasto"] = rubros_m["Gasto"].apply(fmt_money)
+            rubros_m["Ahorro_potencial"] = rubros_m["Ahorro_potencial"].apply(fmt_money)
+            st.dataframe(
+                rubros_m[["Grupo_PNL", "Concepto_PNL", "Accionabilidad", "Gasto", "Ahorro_potencial", "Movimientos", "Proveedores"]],
+                use_container_width=True,
+                height=380
+            )
+
+            st.markdown("### 3. Proveedores trabajables: gasto, recurrencia y oportunidad")
+            prov = base_acc.groupby(["Proveedor_detectado", "Categoria_proveedor", "Accionabilidad"], as_index=False).agg(
+                Gasto=("Importe_CC", "sum"),
+                Ahorro_potencial=("Ahorro potencial", "sum"),
+                Movimientos=("Importe_CC", "count"),
+                Meses_con_gasto=("Mes", "nunique"),
+                Sucursales=("Sucursal", "nunique")
+            )
+            prov["Recurrencia"] = np.where(prov["Meses_con_gasto"] >= 3, "🔁 Recurrente", np.where(prov["Meses_con_gasto"] == 2, "🟡 Intermitente", "⚠️ Puntual"))
+            prov = prov.sort_values("Ahorro_potencial", ascending=False)
+            prov["Etiqueta"] = prov["Ahorro_potencial"].apply(fmt_money_short)
+            fig2 = px.bar(
+                prov.head(20),
+                x="Ahorro_potencial",
+                y="Proveedor_detectado",
+                color="Recurrencia",
+                text="Etiqueta",
+                orientation="h",
+                title="Top proveedores trabajables por ahorro potencial"
+            )
+            preparar_para_labels(fig2)
+            st.plotly_chart(fig2, use_container_width=True)
+            prov_m = prov.copy()
+            prov_m["Gasto"] = prov_m["Gasto"].apply(fmt_money)
+            prov_m["Ahorro_potencial"] = prov_m["Ahorro_potencial"].apply(fmt_money)
+            st.dataframe(
+                prov_m[["Proveedor_detectado", "Categoria_proveedor", "Accionabilidad", "Recurrencia", "Gasto", "Ahorro_potencial", "Movimientos", "Meses_con_gasto", "Sucursales"]].head(50),
+                use_container_width=True,
+                height=430
+            )
+
+            st.markdown("### 4. Pareto de proveedores accionables")
+            pareto = prov[["Proveedor_detectado", "Gasto"]].copy().sort_values("Gasto", ascending=False)
+            pareto["% gasto"] = pareto["Gasto"] / pareto["Gasto"].sum() if pareto["Gasto"].sum() else 0
+            pareto["% acumulado"] = pareto["% gasto"].cumsum()
+            pareto["Gasto"] = pareto["Gasto"].apply(fmt_money)
+            pareto["% gasto"] = pareto["% gasto"].apply(fmt_pct)
+            pareto["% acumulado"] = pareto["% acumulado"].apply(fmt_pct)
+            st.dataframe(pareto.head(30), use_container_width=True, height=360)
+
+            st.markdown("### 5. Oportunidad por sucursal")
+            suc = base_acc.groupby("Sucursal", as_index=False).agg(
+                Gasto=("Importe_CC", "sum"),
+                Ahorro_potencial=("Ahorro potencial", "sum"),
+                Proveedores=("Proveedor_detectado", "nunique"),
+                Movimientos=("Importe_CC", "count")
+            ).sort_values("Ahorro_potencial", ascending=False)
+            suc["Etiqueta"] = suc["Ahorro_potencial"].apply(fmt_money_short)
+            fig3 = px.bar(suc, x="Sucursal", y="Ahorro_potencial", text="Etiqueta", title="Ahorro potencial estimado por sucursal")
+            preparar_para_labels(fig3)
+            st.plotly_chart(fig3, use_container_width=True)
+            suc_m = suc.copy()
+            suc_m["Gasto"] = suc_m["Gasto"].apply(fmt_money)
+            suc_m["Ahorro_potencial"] = suc_m["Ahorro_potencial"].apply(fmt_money)
+            st.dataframe(suc_m[["Sucursal", "Gasto", "Ahorro_potencial", "Proveedores", "Movimientos"]], use_container_width=True)
+
+            st.markdown("### 6. Plan de acción sugerido para dirección")
+            acciones = base_acc.groupby(["Concepto_PNL", "Proveedor_detectado", "Sucursal", "Accionabilidad", "Categoria_proveedor"], as_index=False).agg(
+                Gasto=("Importe_CC", "sum"),
+                Ahorro_potencial=("Ahorro potencial", "sum"),
+                Movimientos=("Importe_CC", "count"),
+                Meses_con_gasto=("Mes", "nunique")
+            )
+            acciones["Acción sugerida"] = acciones.apply(accion_sugerida, axis=1)
+            acciones["Prioridad"] = np.select(
+                [acciones["Ahorro_potencial"] >= 1_000_000, acciones["Ahorro_potencial"] >= 300_000],
+                ["🔴 Alta", "🟠 Media"],
+                default="🟡 Monitorear"
+            )
+            acciones = acciones.sort_values(["Ahorro_potencial", "Gasto"], ascending=False)
+            acciones_m = acciones.copy()
+            acciones_m["Gasto"] = acciones_m["Gasto"].apply(fmt_money)
+            acciones_m["Ahorro_potencial"] = acciones_m["Ahorro_potencial"].apply(fmt_money)
+            st.dataframe(
+                acciones_m[["Prioridad", "Concepto_PNL", "Proveedor_detectado", "Sucursal", "Accionabilidad", "Gasto", "Ahorro_potencial", "Movimientos", "Meses_con_gasto", "Acción sugerida"]].head(80),
+                use_container_width=True,
+                height=520
+            )
+
+            st.markdown("### 7. Insight para presentar")
+            if not acciones.empty and not suc.empty and not rubros.empty:
+                top_accion = acciones.iloc[0]
+                top_suc = suc.iloc[0]
+                top_rubro = rubros.iloc[0]
+                st.info(
+                    f"🧠 El mayor potencial de gestión no necesariamente está en el gasto más grande, sino en el gasto accionable. "
+                    f"Con los filtros actuales se identifica un ahorro potencial estimado de **{fmt_money(ahorro_potencial)}**. "
+                    f"El rubro con mayor oportunidad es **{top_rubro['Concepto_PNL']}** y la principal acción puntual aparece en **{top_accion['Proveedor_detectado']} / {top_accion['Sucursal']}**, "
+                    f"con una oportunidad estimada de **{fmt_money(top_accion['Ahorro_potencial'])}**. "
+                    f"La sucursal donde conviene empezar es **{top_suc['Sucursal']}**."
+                )
+
+            st.download_button(
+                "⬇️ Descargar plan de oportunidades",
+                data=acciones.to_csv(index=False).encode("utf-8-sig"),
+                file_name="plan_oportunidades_ahorro.csv",
+                mime="text/csv"
+            )
+
+with tab5:
     st.subheader("🏭 Análisis de proveedores")
     p1,p2,p3=st.columns(3)
     with p1: centros_p=st.multiselect("Centro de costo", centros_base, default=default_centros(centros_base,"repuestos"), key="centros_prov")
@@ -663,7 +916,7 @@ with tab4:
             cols=["Mes","Fecha","Sucursal","Factura_detectada","Proveedor_detectado","Categoria_proveedor","Nombre del rubro","Concepto_PNL","Detalle","des res","Detalle 2","Importe"]
             st.dataframe(mov[[c for c in cols if c in mov.columns]].head(150), use_container_width=True, height=520)
 
-with tab5:
+with tab6:
     st.subheader("🏢 Benchmark de costos entre sucursales")
     centros_b=st.multiselect("Centro de costo", centros_base, default=default_centros(centros_base,"repuestos"), key="centros_bench")
     grupos_b=st.multiselect("Categoría", ["Costos Controlables","Costos No Controlables"], default=["Costos Controlables"], key="grupo_bench")
@@ -680,7 +933,7 @@ with tab5:
         topc=base_b[base_b["Sucursal"]==mayor["Sucursal"]].groupby("Concepto_PNL",as_index=False)["Importe_CC"].sum().sort_values("Importe_CC",ascending=False).head(3); ctxt=", ".join([f"{r['Concepto_PNL']} ({fmt_money(r['Importe_CC'])})" for _,r in topc.iterrows()])
         st.info(f"🧠 **{mayor['Sucursal']}** concentra **{fmt_pct(part)}** del costo total en **{label_centros(centros_b)}**, con **{fmt_money(mayor['Costo total'])}**. La menor es **{menor['Sucursal']}** con **{fmt_money(menor['Costo total'])}**. Principales conceptos: **{ctxt}**. ✅ Revisar escala operativa, contratos, consumos o imputaciones.")
 
-with tab6:
+with tab7:
     st.subheader("📑 P&L mensual interactivo")
     meses_pnl=st.multiselect("Meses a mostrar", meses_all, default=meses_all[-4:])
     if not meses_pnl: st.warning("Seleccioná al menos un mes.")
@@ -696,7 +949,7 @@ with tab6:
                 for col in meses_pnl+["Acumulado"]: mg[col]=mg[col].apply(fmt_money)
                 st.dataframe(mg, use_container_width=True, height=350)
 
-with tab7:
+with tab8:
     st.subheader("📒 Evolución por cuenta contable")
     col1,col2,col3=st.columns(3)
     with col1: centros_cta=st.multiselect("Centro de costo", centros_base, default=default_centros(centros_base,"repuestos"), key="centros_cuentas")
@@ -731,12 +984,12 @@ with tab7:
         st.dataframe(mov[[c for c in cols if c in mov.columns]].head(150), use_container_width=True, height=520)
         st.download_button("⬇️ Descargar evolución por cuenta contable", data=tabla.to_csv(index=False).encode("utf-8-sig"), file_name=f"evolucion_cuentas_{label_centros(centros_cta)}.csv", mime="text/csv")
 
-with tab8:
+with tab9:
     st.subheader("🧾 Control de signos")
     control=df_filtrado.groupby(["Nombre del rubro","Signo_rubro"],as_index=False).agg(Parcial_original=("Parcial","sum"),Parcial_gestion=("Parcial_Gestion","sum")); control["Parcial original"]=control["Parcial_original"].apply(fmt_money); control["Parcial gestión"]=control["Parcial_gestion"].apply(fmt_money)
     st.dataframe(control[["Nombre del rubro","Signo_rubro","Parcial original","Parcial gestión"]], use_container_width=True, height=650)
 
-with tab9:
+with tab10:
     st.subheader("🔎 Drilldown contable")
     buscar=st.text_input("Buscar por cuenta, proveedor, factura, detalle, descripción o rubro")
     drill=df_filtrado.copy()
@@ -755,7 +1008,7 @@ with tab9:
     st.dataframe(dm[[c for c in cols if c in dm.columns]], use_container_width=True, height=650)
     st.download_button("⬇️ Descargar drilldown filtrado", data=drill.to_csv(index=False).encode("utf-8-sig"), file_name="drilldown_mayores_lux.csv", mime="text/csv")
 
-with tab10:
+with tab11:
     st.subheader("⚙️ Diccionario y reglas del modelo")
     st.markdown("""
 ### 1. Lógica principal
@@ -773,6 +1026,9 @@ El proveedor se detecta automáticamente desde `Detalle`, `des res` y `Detalle 2
 ### 4. Heatmap sucursales
 Cada celda muestra `$ importe (% participación dentro del concepto)` con color por concentración.
 
-### 5. Cuentas contables
+### 5. Oportunidades de Ahorro
+Este tab separa gastos de baja accionabilidad (alquileres, licencias Toyota, Oversoft, etc.) de gastos trabajables. Estima ahorro potencial conservador: 10% para alta accionabilidad y 5% para media.
+
+### 6. Cuentas contables
 Permite ver número de cuenta, nombre, rubro+subrubro, categoría, importe mensual, evolución, severidad y movimientos explicativos.
 """)
