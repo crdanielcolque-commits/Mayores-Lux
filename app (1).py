@@ -61,7 +61,10 @@ PNL = [
     ("menos","Impuestos Financiación",["11-1"],"Egresos Financieros"),("menos","Intereses Impositivos",["11-2"],"Egresos Financieros"),
     ("menos","Comisiones y gastos bancarios",["11-3"],"Egresos Financieros"),("menos","Financiación cap trab",["11-4"],"Egresos Financieros"),
     ("igual","Resultado antes de Impuestos",[],"Resultado antes de Impuestos"),("menos","Impuesto a las Ganancias",[],"Impuesto a las Ganancias"),
-    ("igual","Resultado después de Impuestos",[],"Resultado después de Impuestos")
+    ("igual","Resultado después de Impuestos",[],"Resultado después de Impuestos"),
+    ("info","Egresos Dirección",["9-10"],"Fuera del Resultado Modelado"),
+    ("info","Ingresos Extraordinarios",["12-1"],"Fuera del Resultado Modelado"),
+    ("info","Egresos Extraordinarios",["12-2"],"Fuera del Resultado Modelado")
 ]
 
 # ---------- formatos y limpieza ----------
@@ -265,19 +268,408 @@ def tabla_variaciones(base, index_cols):
     piv["Impacto_abs"] = piv["Variación $"].abs()
     return piv.sort_values("Impacto_abs", ascending=False)
 
-def construir_pnl_mensual(df, meses):
-    filas, acumulados = [], {m: 0.0 for m in meses}
-    for logica, concepto, rubros, grupo in PNL:
-        fila = {"Lógica": logica, "Grupo": grupo, "Concepto": concepto, "Rubros": " + ".join(rubros)}
-        for mes in meses:
-            dmes = df[df["Mes"] == mes]
-            if rubros:
-                bruto = dmes.loc[dmes["Rubro_calc"].isin(rubros), "Parcial_Gestion"].sum()
-                importe = -abs(bruto) if logica == "menos" else abs(bruto) if logica == "mas" else bruto
-                acumulados[mes] += importe; fila[mes] = importe
-            else: fila[mes] = acumulados[mes]
-        fila["Acumulado"] = sum(fila[m] for m in meses); filas.append(fila)
+
+def _importe_rubros_mes(df, mes, rubros, centros_sel, magnitud=True):
+    """
+    Devuelve el importe imputado a los centros seleccionados para los rubros indicados.
+    Usa las columnas monetarias de centro de costo, no Parcial_Gestion.
+    """
+    dmes = df[(df["Mes"] == mes) & (df["Rubro_calc"].isin(rubros))].copy()
+    if dmes.empty:
+        return 0.0
+    valor = campo_centros_gestion(dmes, centros_sel).sum()
+    return abs(valor) if magnitud else float(valor)
+
+
+def _importe_texto_mes(df, mes, centros_sel, palabras_todas=None, palabras_alguna=None):
+    """
+    Busca movimientos no identificados por Rub/SRub a partir de Detalle/des res/Detalle 2/Nombre cuenta/Nombre rubro.
+    Sirve para líneas especiales como Ajuste Costo de Reposición y Transferencia repuestos a taller.
+    """
+    dmes = df[df["Mes"] == mes].copy()
+    if dmes.empty:
+        return 0.0
+
+    texto = (
+        dmes["Detalle"].astype(str) + " " +
+        dmes["des res"].astype(str) + " " +
+        dmes["Detalle 2"].astype(str) + " " +
+        dmes["Nombre cuenta"].astype(str) + " " +
+        dmes["Nombre del rubro"].astype(str)
+    ).str.upper()
+
+    mask = pd.Series(True, index=dmes.index)
+    if palabras_todas:
+        for p in palabras_todas:
+            mask &= texto.str.contains(str(p).upper(), na=False, regex=False)
+    if palabras_alguna:
+        mask_alguna = pd.Series(False, index=dmes.index)
+        for p in palabras_alguna:
+            mask_alguna |= texto.str.contains(str(p).upper(), na=False, regex=False)
+        mask &= mask_alguna
+
+    encontrados = dmes[mask].copy()
+    if encontrados.empty:
+        return 0.0
+    return float(campo_centros_gestion(encontrados, centros_sel).sum())
+
+
+def construir_pnl_mensual_validado(df, meses, centros_sel):
+    """
+    Replica la lógica validada contra la cuenta de resultados compartida:
+    Margen Bruto Gestión Comercial
+    -> Margen Bruto Primario
+    -> Margen Bruto Secundario
+    -> Otros Ingresos / Egresos
+    -> Utilidad Bruta
+    -> Transferencia Repuestos a Taller
+    -> Costos Controlables / No Controlables
+    -> Utilidad Operativa Sucursal
+    -> Costos de Estructura
+    -> Utilidad Operativa
+    -> Resultado Financiero Operativo
+    -> Resultado antes de Impuestos
+    -> Impuesto a las Ganancias
+    -> Resultado después de Impuestos
+
+    Importante:
+    - Los gastos se muestran como magnitud positiva, igual que en el modelo validado.
+    - Descuentos e Impuesto a las Ganancias se muestran negativos.
+    - La transferencia conserva signo según el/los centros seleccionados y se neutraliza al consolidar
+      Repuestos + Taller, si la base contiene el movimiento explícito.
+    - 9-10 / 12-1 / 12-2 se muestran aparte y NO se incorporan al resultado validado.
+    """
+    filas = []
+
+    def add(concepto, grupo, rubros="", logica="", valores=None, tipo="detalle"):
+        fila = {
+            "Grupo": grupo,
+            "Concepto": concepto,
+            "Rubros": rubros,
+            "Lógica": logica,
+            "Tipo": tipo,
+        }
+        for m in meses:
+            fila[m] = float(valores.get(m, 0.0)) if valores else 0.0
+        fila["Acumulado"] = sum(fila[m] for m in meses)
+        filas.append(fila)
+
+    # Diccionarios mensuales para subtotales
+    ventas = {}
+    descuentos = {}
+    costo_ventas = {}
+    gestoria = {}
+    mb_gestion = {}
+    ajuste_repos = {}
+    reacond = {}
+    mb_primario = {}
+    incentivos = {}
+    incentivo_dev = {}
+    consignaciones = {}
+    comisiones_pagadas = {}
+    com_vta_directa = {}
+    mb_secundario = {}
+
+    mermas = {}
+    sobrantes = {}
+    perdida_iva = {}
+    horas_no_aplicadas = {}
+    resultado_ppaa = {}
+    ingresos_seguros = {}
+    egresos_seguros = {}
+    otros_ie = {}
+    utilidad_bruta = {}
+    transferencia = {}
+
+    # Controlables
+    controlables_rubros = [
+        ("Comisiones sobre Ventas", ["7-2"]),
+        ("Sueldos y Cargas Sociales", ["8-1"]),
+        ("Sueldos Administración y C. Soc.", ["8-4"]),
+        ("Gastos de Atención clientes", ["7-1"]),
+        ("Servicios gratuitos y Cargos internos", ["7-4"]),
+        ("Herramientas, materiales y fletes", ["7-6"]),
+        ("Publicidad y Promoción", ["8-2"]),
+        ("Mantenimiento rodados y equipos", ["8-3"]),
+        ("Movilidad y Viáticos", ["8-6"]),
+        ("Mantenimiento Bienes de Uso", ["8-8"]),
+        ("Fuerza motriz, luz, agua y gas", ["8-9"]),
+        ("Teléfonos e internet", ["8-10"]),
+        ("Serv. Limpieza", ["8-11"]),
+        ("Útiles y materiales de oficina", ["8-12"]),
+        ("Otros Gastos Fijos", ["8-13"]),
+        ("Alquileres", ["8-14"]),
+        ("Previsiones Varias", ["8-17"]),
+        ("Deudores Incobrables", ["8-19"]),
+        ("Preparación y entrega", ["7-3"]),
+        ("Seguridad y vigilancia", ["8-20"]),
+    ]
+
+    no_controlables_rubros = [
+        ("Impuestos", ["7-5"]),
+        ("Honorarios profesionales", ["8-5"]),
+        ("Recupero de Gastos Toyota", ["8-7"]),
+        ("Amortizaciones", ["8-15"]),
+        ("Seguros", ["8-16"]),
+        ("Impuestos y tasas", ["8-18"]),
+    ]
+
+    estructura_controlable_rubros = [
+        ("Sueldos Gtes y Jefes Suc.", ["9-1"]),
+        ("Sueldos Adm. Central", ["9-2"]),
+        ("Prestaciones La Luz", ["9-3"]),
+        ("Movilidad y Viáticos", ["9-4"]),
+        ("Mantenimiento Bs Uso Central", ["9-5"]),
+        ("Útiles y materiales de oficina", ["9-6"]),
+        ("Serv., Energía, Suscripciones Adm Central", ["9-7"]),
+        ("Alquileres Adm Central", ["9-9"]),
+    ]
+
+    estructura_no_controlable_rubros = [
+        ("Amortizaciones", ["9-8"]),
+    ]
+
+    controlables_detalle = {nombre: {} for nombre, _ in controlables_rubros}
+    no_controlables_detalle = {nombre: {} for nombre, _ in no_controlables_rubros}
+    est_ctrl_detalle = {nombre: {} for nombre, _ in estructura_controlable_rubros}
+    est_noctrl_detalle = {nombre: {} for nombre, _ in estructura_no_controlable_rubros}
+
+    total_controlables = {}
+    total_no_controlables = {}
+    total_control_no_control = {}
+    utilidad_operativa_sucursal = {}
+    total_est_ctrl = {}
+    total_est_noctrl = {}
+    total_estructura = {}
+    utilidad_operativa = {}
+
+    int_fin_veh = {}
+    otros_ing_fin = {}
+    total_ing_fin = {}
+    imp_fin = {}
+    int_impositivos = {}
+    com_gastos_banc = {}
+    fin_cap_trab = {}
+    total_egr_fin = {}
+    resultado_fin_operativo = {}
+    resultado_antes_imp = {}
+    imp_ganancias = {}
+    resultado_despues_imp = {}
+
+    egresos_direccion = {}
+    ingresos_extra = {}
+    egresos_extra = {}
+
+    for m in meses:
+        ventas[m] = _importe_rubros_mes(df, m, ["4-1"], centros_sel, magnitud=True)
+        descuentos[m] = -_importe_rubros_mes(df, m, ["4-2"], centros_sel, magnitud=True)
+        costo_ventas[m] = _importe_rubros_mes(df, m, ["5-1"], centros_sel, magnitud=True)
+        gestoria[m] = _importe_rubros_mes(df, m, ["6-1", "6-2"], centros_sel, magnitud=True)
+
+        mb_gestion[m] = ventas[m] + descuentos[m] - costo_ventas[m] - gestoria[m]
+
+        # Sin Rub/SRub fijo en el esquema compartido: se intenta localizar por texto.
+        ajuste_repos[m] = abs(_importe_texto_mes(
+            df, m, centros_sel,
+            palabras_todas=["AJUSTE", "COSTO"],
+            palabras_alguna=["REPOSICION", "REPOSICIÓN"]
+        ))
+        reacond[m] = _importe_rubros_mes(df, m, ["5-2"], centros_sel, magnitud=True)
+        mb_primario[m] = mb_gestion[m] - ajuste_repos[m] - reacond[m]
+
+        incentivos[m] = _importe_rubros_mes(df, m, ["4-3"], centros_sel, magnitud=True)
+        incentivo_dev[m] = _importe_rubros_mes(df, m, ["4-4"], centros_sel, magnitud=True)
+        consignaciones[m] = _importe_rubros_mes(df, m, ["6-3"], centros_sel, magnitud=True)
+        comisiones_pagadas[m] = _importe_rubros_mes(df, m, ["6-6"], centros_sel, magnitud=True)
+        com_vta_directa[m] = _importe_rubros_mes(df, m, ["10-1"], centros_sel, magnitud=True)
+
+        mb_secundario[m] = (
+            mb_primario[m]
+            + incentivos[m]
+            + incentivo_dev[m]
+            + consignaciones[m]
+            - comisiones_pagadas[m]
+            + com_vta_directa[m]
+        )
+
+        mermas[m] = _importe_rubros_mes(df, m, ["5-3"], centros_sel, magnitud=True)
+        sobrantes[m] = _importe_rubros_mes(df, m, ["5-4"], centros_sel, magnitud=True)
+        perdida_iva[m] = _importe_rubros_mes(df, m, ["5-5"], centros_sel, magnitud=True)
+        horas_no_aplicadas[m] = _importe_rubros_mes(df, m, ["6-4"], centros_sel, magnitud=True)
+        resultado_ppaa[m] = _importe_rubros_mes(df, m, ["6-5"], centros_sel, magnitud=True)
+        ingresos_seguros[m] = _importe_rubros_mes(df, m, ["10-4"], centros_sel, magnitud=True)
+        egresos_seguros[m] = _importe_rubros_mes(df, m, ["11-5"], centros_sel, magnitud=True)
+
+        otros_ie[m] = (
+            - mermas[m]
+            - sobrantes[m]
+            - perdida_iva[m]
+            - horas_no_aplicadas[m]
+            + resultado_ppaa[m]
+            + ingresos_seguros[m]
+            - egresos_seguros[m]
+        )
+        utilidad_bruta[m] = mb_secundario[m] + otros_ie[m]
+
+        # Línea especial. Mantiene el signo que traen los centros seleccionados.
+        transferencia[m] = _importe_texto_mes(
+            df, m, centros_sel,
+            palabras_todas=["REPUEST"],
+            palabras_alguna=["TRANSFER", "TALLER"]
+        )
+
+        tc = 0.0
+        for nombre, rubros in controlables_rubros:
+            val = _importe_rubros_mes(df, m, rubros, centros_sel, magnitud=True)
+            controlables_detalle[nombre][m] = val
+            tc += val
+        total_controlables[m] = tc
+
+        tnc = 0.0
+        for nombre, rubros in no_controlables_rubros:
+            val = _importe_rubros_mes(df, m, rubros, centros_sel, magnitud=True)
+            no_controlables_detalle[nombre][m] = val
+            tnc += val
+        total_no_controlables[m] = tnc
+        total_control_no_control[m] = tc + tnc
+
+        utilidad_operativa_sucursal[m] = (
+            utilidad_bruta[m]
+            + transferencia[m]
+            - total_controlables[m]
+            - total_no_controlables[m]
+        )
+
+        tec = 0.0
+        for nombre, rubros in estructura_controlable_rubros:
+            val = _importe_rubros_mes(df, m, rubros, centros_sel, magnitud=True)
+            est_ctrl_detalle[nombre][m] = val
+            tec += val
+        total_est_ctrl[m] = tec
+
+        tenc = 0.0
+        for nombre, rubros in estructura_no_controlable_rubros:
+            val = _importe_rubros_mes(df, m, rubros, centros_sel, magnitud=True)
+            est_noctrl_detalle[nombre][m] = val
+            tenc += val
+        total_est_noctrl[m] = tenc
+        total_estructura[m] = tec + tenc
+
+        utilidad_operativa[m] = utilidad_operativa_sucursal[m] - total_estructura[m]
+
+        int_fin_veh[m] = _importe_rubros_mes(df, m, ["10-2"], centros_sel, magnitud=True)
+        otros_ing_fin[m] = _importe_rubros_mes(df, m, ["10-3"], centros_sel, magnitud=True)
+        total_ing_fin[m] = int_fin_veh[m] + otros_ing_fin[m]
+
+        imp_fin[m] = _importe_rubros_mes(df, m, ["11-1"], centros_sel, magnitud=True)
+        int_impositivos[m] = _importe_rubros_mes(df, m, ["11-2"], centros_sel, magnitud=True)
+        com_gastos_banc[m] = _importe_rubros_mes(df, m, ["11-3"], centros_sel, magnitud=True)
+        fin_cap_trab[m] = _importe_rubros_mes(df, m, ["11-4"], centros_sel, magnitud=True)
+        total_egr_fin[m] = imp_fin[m] + int_impositivos[m] + com_gastos_banc[m] + fin_cap_trab[m]
+
+        resultado_fin_operativo[m] = total_ing_fin[m] - total_egr_fin[m]
+        resultado_antes_imp[m] = utilidad_operativa[m] + resultado_fin_operativo[m]
+
+        # En la base de mayores puede no existir una línea calculada de impuesto a las ganancias.
+        # Si existe rubro/cuenta explícito por texto, se toma; si no, queda 0 y no se inventa.
+        imp_ganancias[m] = -abs(_importe_texto_mes(
+            df, m, centros_sel,
+            palabras_todas=["GANANCIAS"],
+            palabras_alguna=["IMPUESTO", "IMP"]
+        ))
+        resultado_despues_imp[m] = resultado_antes_imp[m] + imp_ganancias[m]
+
+        # Informativos: presentes en el modelo compartido, fuera del resultado mostrado.
+        egresos_direccion[m] = _importe_rubros_mes(df, m, ["9-10"], centros_sel, magnitud=True)
+        ingresos_extra[m] = _importe_rubros_mes(df, m, ["12-1"], centros_sel, magnitud=True)
+        egresos_extra[m] = _importe_rubros_mes(df, m, ["12-2"], centros_sel, magnitud=True)
+
+    # Construcción de la presentación en el mismo orden lógico del modelo validado
+    add("Ventas", "Margen Bruto Gestión Comercial", "4-1", "más", ventas)
+    add("Descuentos sobre ventas", "Margen Bruto Gestión Comercial", "4-2", "menos", descuentos)
+    add("Costo de Ventas", "Margen Bruto Gestión Comercial", "5-1", "menos", costo_ventas)
+    add("Rdo. Neto Gestoría", "Margen Bruto Gestión Comercial", "6-1 + 6-2", "menos", gestoria)
+    add("Margen Bruto Gestión Comercial", "Margen Bruto Gestión Comercial", "", "igual", mb_gestion, "subtotal")
+
+    add("Ajuste Costo de Reposición", "Margen Bruto Secundario", "", "menos", ajuste_repos)
+    add("Costo Reacondic. y Acces.", "Margen Bruto Secundario", "5-2", "menos", reacond)
+    add("Margen Bruto Primario", "Margen Bruto Secundario", "", "igual", mb_primario, "subtotal")
+    add("Incentivos", "Margen Bruto Secundario", "4-3", "más", incentivos)
+    add("Incentivo Devengado", "Margen Bruto Secundario", "4-4", "más", incentivo_dev)
+    add("Comisión Consignaciones", "Margen Bruto Secundario", "6-3", "más", consignaciones)
+    add("Comisión Pagadas", "Margen Bruto Secundario", "6-6", "menos", comisiones_pagadas)
+    add("Comisión P/Vta Directa", "Margen Bruto Secundario", "10-1", "más", com_vta_directa)
+    add("Margen Bruto Secundario", "Margen Bruto Secundario", "", "igual", mb_secundario, "subtotal")
+
+    add("Otros Ingresos / Egresos", "Otros Ingresos / Egresos", "", "subtotal", otros_ie, "subtotal")
+    add("Mermas de Inventarios", "Otros Ingresos / Egresos", "5-3", "menos", mermas)
+    add("Sobrantes de Inventarios", "Otros Ingresos / Egresos", "5-4", "menos", sobrantes)
+    add("Pérdida IVA Usados", "Otros Ingresos / Egresos", "5-5", "menos", perdida_iva)
+    add("Horas no aplicadas mecánicos", "Otros Ingresos / Egresos", "6-4", "menos", horas_no_aplicadas)
+    add("Resultado Venta de PPAA MS", "Otros Ingresos / Egresos", "6-5", "más", resultado_ppaa)
+    add("Ingresos Seguros y Comis Gestión Vta", "Otros Ingresos / Egresos", "10-4", "más", ingresos_seguros)
+    add("Egresos Seguros", "Otros Ingresos / Egresos", "11-5", "menos", egresos_seguros)
+    add("Utilidad Bruta", "Utilidad Bruta", "", "igual", utilidad_bruta, "subtotal")
+
+    add("Transferencia repuestos a taller", "Transferencia interna", "", "+/-", transferencia)
+    add("Ctos Controlables y no Controlables", "Costos Operativos", "", "subtotal", total_control_no_control, "subtotal")
+
+    add("Costos Controlables", "Costos Controlables", "", "grupo", {m: 0 for m in meses}, "encabezado")
+    for nombre, rubros in controlables_rubros:
+        add(nombre, "Costos Controlables", " + ".join(rubros), "menos", controlables_detalle[nombre])
+    add("Total costos controlables", "Costos Controlables", "", "total", total_controlables, "subtotal")
+
+    add("Costos No Controlables", "Costos No Controlables", "", "grupo", {m: 0 for m in meses}, "encabezado")
+    for nombre, rubros in no_controlables_rubros:
+        add(nombre, "Costos No Controlables", " + ".join(rubros), "menos", no_controlables_detalle[nombre])
+    add("Total costos no controlables", "Costos No Controlables", "", "total", total_no_controlables, "subtotal")
+
+    add("Utilidad Operativa Sucursal", "Utilidad Operativa Sucursal", "", "igual", utilidad_operativa_sucursal, "subtotal")
+
+    add("Costos Estruct. Adm. Central", "Estructura", "", "subtotal", total_estructura, "subtotal")
+    for nombre, rubros in estructura_controlable_rubros:
+        add(nombre, "Controlables de Estructura", " + ".join(rubros), "menos", est_ctrl_detalle[nombre])
+    add("Total costos Controlables de Estructura", "Controlables de Estructura", "", "total", total_est_ctrl, "subtotal")
+    for nombre, rubros in estructura_no_controlable_rubros:
+        add(nombre, "Costos no Controlables de Estructura", " + ".join(rubros), "menos", est_noctrl_detalle[nombre])
+    add("Total costos no Controlables de Estructura", "Costos no Controlables de Estructura", "", "total", total_est_noctrl, "subtotal")
+
+    add("Utilidad Operativa", "Utilidad Operativa", "", "igual", utilidad_operativa, "subtotal")
+
+    add("Ingresos Financieros", "Ingresos Financieros", "", "subtotal", total_ing_fin, "subtotal")
+    add("Intereses Financiación Vehículos", "Ingresos Financieros", "10-2", "más", int_fin_veh)
+    add("Otros Ingresos Financieros", "Ingresos Financieros", "10-3", "más", otros_ing_fin)
+
+    add("Egresos Financieros", "Egresos Financieros", "", "subtotal", total_egr_fin, "subtotal")
+    add("Impuestos Financiación", "Egresos Financieros", "11-1", "menos", imp_fin)
+    add("Intereses Impositivos", "Egresos Financieros", "11-2", "menos", int_impositivos)
+    add("Comisiones y gastos bancarios", "Egresos Financieros", "11-3", "menos", com_gastos_banc)
+    add("Financiación cap trab", "Egresos Financieros", "11-4", "menos", fin_cap_trab)
+
+    add("Resultado Financiero Operativo", "Resultado Financiero Operativo", "", "igual", resultado_fin_operativo, "subtotal")
+    add("Resultado antes de Impuestos", "Resultado antes de Impuestos", "", "igual", resultado_antes_imp, "subtotal")
+    add("Impuesto a las Ganancias", "Impuesto a las Ganancias", "", "menos", imp_ganancias)
+    add("Resultado después de Impuestos", "Resultado después de Impuestos", "", "igual", resultado_despues_imp, "subtotal")
+
+    add("Egresos Dirección (fuera del resultado validado)", "Fuera del Resultado Modelado", "9-10", "informativo", egresos_direccion)
+    add("Ingresos Extraordinarios (fuera del resultado validado)", "Fuera del Resultado Modelado", "12-1", "informativo", ingresos_extra)
+    add("Egresos Extraordinarios (fuera del resultado validado)", "Fuera del Resultado Modelado", "12-2", "informativo", egresos_extra)
+
     return pd.DataFrame(filas)
+
+
+def construir_pnl_porcentajes(pnl_df, meses):
+    """Calcula cada línea como % de Ventas del mismo mes, igual que el modelo de validación."""
+    out = pnl_df[["Grupo", "Concepto", "Rubros", "Lógica", "Tipo"]].copy()
+    for m in meses:
+        ventas_rows = pnl_df[pnl_df["Concepto"] == "Ventas"]
+        ventas = float(ventas_rows[m].iloc[0]) if not ventas_rows.empty else 0.0
+        out[m] = np.where(
+            ventas != 0,
+            pnl_df[m].astype(float) / abs(ventas),
+            np.nan
+        )
+    return out
 
 def styled_heatmap_percent(df_num):
     row_totals = df_num.abs().sum(axis=1).replace(0, np.nan)
@@ -934,20 +1326,127 @@ with tab6:
         st.info(f"🧠 **{mayor['Sucursal']}** concentra **{fmt_pct(part)}** del costo total en **{label_centros(centros_b)}**, con **{fmt_money(mayor['Costo total'])}**. La menor es **{menor['Sucursal']}** con **{fmt_money(menor['Costo total'])}**. Principales conceptos: **{ctxt}**. ✅ Revisar escala operativa, contratos, consumos o imputaciones.")
 
 with tab7:
-    st.subheader("📑 P&L mensual interactivo")
-    meses_pnl=st.multiselect("Meses a mostrar", meses_all, default=meses_all[-4:])
-    if not meses_pnl: st.warning("Seleccioná al menos un mes.")
+    st.subheader("📑 P&L mensual interactivo — modelo validado")
+    st.caption(
+        "Estructura replicada contra la cuenta de resultados de referencia: "
+        "Utilidad Bruta → Transferencia interna → Costos Controlables / No Controlables "
+        "→ Utilidad Operativa Sucursal → Estructura → Utilidad Operativa → Resultado Financiero → Resultado final."
+    )
+
+    p1, p2 = st.columns(2)
+    with p1:
+        centros_pnl = st.multiselect(
+            "Centro(s) de costo",
+            centros_base,
+            default=[c for c in ["Repuestos", "Tl. Mec."] if c in centros_base] or default_centros(centros_base, "repuestos"),
+            key="centros_pnl_validado"
+        )
+    with p2:
+        meses_pnl = st.multiselect(
+            "Meses a mostrar",
+            meses_all,
+            default=meses_all[-4:],
+            key="meses_pnl_validado"
+        )
+
+    if not centros_pnl:
+        st.warning("Seleccioná al menos un centro de costo.")
+    elif not meses_pnl:
+        st.warning("Seleccioná al menos un mes.")
     else:
-        pnl=construir_pnl_mensual(df_filtrado, meses_pnl); resumen=pnl.groupby("Grupo",as_index=False)[meses_pnl+["Acumulado"]].sum(); mr=resumen.copy()
-        for col in meses_pnl+["Acumulado"]: mr[col]=mr[col].apply(fmt_money)
-        st.markdown("### Resumen por grupo"); st.dataframe(mr, use_container_width=True)
-        st.markdown("### Detalle expandible por grupo")
-        for grupo in pnl["Grupo"].drop_duplicates():
-            dg=pnl[pnl["Grupo"]==grupo].copy(); total=dg[dg["Lógica"]!="igual"]["Acumulado"].sum()
-            with st.expander(f"➕ {grupo} | Acumulado {fmt_money(total)}", expanded=False):
-                mg=dg[["Lógica","Concepto","Rubros"]+meses_pnl+["Acumulado"]].copy()
-                for col in meses_pnl+["Acumulado"]: mg[col]=mg[col].apply(fmt_money)
-                st.dataframe(mg, use_container_width=True, height=350)
+        meses_pnl = sorted(meses_pnl)
+        pnl = construir_pnl_mensual_validado(df_filtrado, meses_pnl, centros_pnl)
+
+        # KPIs del último mes seleccionado
+        ultimo_mes = meses_pnl[-1]
+
+        def _valor_pnl(concepto):
+            x = pnl.loc[pnl["Concepto"] == concepto, ultimo_mes]
+            return float(x.iloc[0]) if not x.empty else 0.0
+
+        ventas_pnl = _valor_pnl("Ventas")
+        ub_pnl = _valor_pnl("Utilidad Bruta")
+        uos_pnl = _valor_pnl("Utilidad Operativa Sucursal")
+        uo_pnl = _valor_pnl("Utilidad Operativa")
+        rai_pnl = _valor_pnl("Resultado antes de Impuestos")
+        rdi_pnl = _valor_pnl("Resultado después de Impuestos")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Centro(s)", label_centros(centros_pnl))
+        k2.metric("Ventas", fmt_money(ventas_pnl))
+        k3.metric("Utilidad Bruta", fmt_money(ub_pnl), fmt_pct(ub_pnl / ventas_pnl if ventas_pnl else np.nan))
+        k4.metric("Utilidad Operativa", fmt_money(uo_pnl), fmt_pct(uo_pnl / ventas_pnl if ventas_pnl else np.nan))
+        k5.metric("Resultado antes Imp.", fmt_money(rai_pnl), fmt_pct(rai_pnl / ventas_pnl if ventas_pnl else np.nan))
+
+        st.markdown("### Estado de resultados — importes")
+
+        pnl_mostrar = pnl[["Grupo", "Concepto", "Rubros", "Lógica", "Tipo"] + meses_pnl + ["Acumulado"]].copy()
+        for col in meses_pnl + ["Acumulado"]:
+            pnl_mostrar[col] = pnl_mostrar[col].apply(fmt_money)
+
+        st.dataframe(
+            pnl_mostrar,
+            use_container_width=True,
+            height=820,
+            hide_index=True
+        )
+
+        st.markdown("### Estado de resultados — % sobre ventas")
+        pnl_pct = construir_pnl_porcentajes(pnl, meses_pnl)
+        pnl_pct_mostrar = pnl_pct.copy()
+        for col in meses_pnl:
+            pnl_pct_mostrar[col] = pnl_pct_mostrar[col].apply(fmt_pct)
+
+        st.dataframe(
+            pnl_pct_mostrar,
+            use_container_width=True,
+            height=620,
+            hide_index=True
+        )
+
+        st.markdown("### Validaciones automáticas del modelo")
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Utilidad Bruta", fmt_money(ub_pnl))
+        v2.metric("Utilidad Oper. Sucursal", fmt_money(uos_pnl))
+        v3.metric("Utilidad Operativa", fmt_money(uo_pnl))
+        v4.metric("Resultado después Imp.", fmt_money(rdi_pnl))
+
+        # Transferencia interna: explica si netea o no
+        transf = _valor_pnl("Transferencia repuestos a taller")
+        if "Repuestos" in centros_pnl and "Tl. Mec." in centros_pnl:
+            if abs(transf) < 1:
+                st.success(
+                    "✅ La transferencia Repuestos → Taller se neutraliza en el consolidado seleccionado, "
+                    "como corresponde a una transferencia interna."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Se detectó una transferencia neta de {fmt_money(transf)} aun consolidando Repuestos + Taller. "
+                    "Conviene revisar la imputación del movimiento en el mayor."
+                )
+        elif abs(transf) > 0:
+            st.info(
+                f"ℹ️ Transferencia interna detectada para la selección: **{fmt_money(transf)}**. "
+                "La línea conserva su signo porque se está visualizando un centro individual o un subconjunto."
+            )
+        else:
+            st.caption(
+                "Transferencia Repuestos → Taller: no se detectó un movimiento explícito por texto en la base para este período. "
+                "El modelo no inventa el importe; queda en $0 si el mayor no lo identifica."
+            )
+
+        st.markdown("### Resultado financiero")
+        rfo = _valor_pnl("Resultado Financiero Operativo")
+        st.info(
+            f"Para **{ultimo_mes}**, la Utilidad Operativa es **{fmt_money(uo_pnl)}** y el "
+            f"Resultado Financiero Operativo es **{fmt_money(rfo)}**, llegando a un "
+            f"Resultado antes de Impuestos de **{fmt_money(rai_pnl)}**."
+        )
+
+        st.caption(
+            "Nota: Egresos Dirección (9-10), Ingresos Extraordinarios (12-1) y Egresos Extraordinarios (12-2) "
+            "se muestran como líneas informativas y quedan fuera del resultado validado, tal como en el modelo de referencia."
+        )
 
 with tab8:
     st.subheader("📒 Evolución por cuenta contable")
@@ -1010,6 +1509,23 @@ with tab10:
 
 with tab11:
     st.subheader("⚙️ Diccionario y reglas del modelo")
+    st.markdown("""
+### P&L validado
+La pestaña **📑 P&L** sigue la secuencia validada contra la cuenta de resultados de referencia:
+
+1. Ventas - Descuentos - Costo de Ventas - Rdo. Neto Gestoría = **Margen Bruto Gestión Comercial**.
+2. Ajustes + reacondicionamiento + incentivos/comisiones = **Margen Bruto Secundario**.
+3. Otros ingresos/egresos = **Utilidad Bruta**.
+4. Se incorpora la **Transferencia Repuestos → Taller** con signo por centro; al consolidar ambos centros debe neutralizarse.
+5. Se restan **Costos Controlables + Costos No Controlables** = **Utilidad Operativa Sucursal**.
+6. Se restan **Costos de Estructura de Administración Central** = **Utilidad Operativa**.
+7. Ingresos financieros - egresos financieros = **Resultado Financiero Operativo**.
+8. Utilidad Operativa + Resultado Financiero = **Resultado antes de Impuestos**.
+9. Se descuenta **Impuesto a las Ganancias** cuando existe movimiento identificable = **Resultado después de Impuestos**.
+
+Las líneas 9-10, 12-1 y 12-2 se informan aparte y no se incorporan al resultado validado.
+""")
+
     st.markdown("""
 ### 1. Lógica principal
 - Cada fila del mayor es un movimiento contable individual.
