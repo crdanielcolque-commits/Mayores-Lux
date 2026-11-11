@@ -1,4 +1,5 @@
 import re
+import unicodedata
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -117,30 +118,70 @@ def extraer_factura_texto(texto):
 
 def extraer_factura(row): return extraer_factura_texto(" ".join([str(row.get(c, "")) for c in ["Detalle", "des res", "Detalle 2"]]))
 
-def normalizar_proveedor_nombre(proveedor):
-    p = str(proveedor).upper().strip()
-    reglas = {"ROQUE JUAN LOZANO":"ROQUE JUAN LOZANO", "LOZANO MARIA":"LOZANO MARIA", "TOYOTA ENTINA":"TOYOTA ENTINA", "TOYOTA ARGENTINA":"TOYOTA ARGENTINA", "OVERSOFT":"OVERSOFT", "EJE EJE LAS LOMAS":"EJE EJE LAS LOMAS", "MERCADO LIBRE":"MERCADO LIBRE", "MERCADOLIBRE":"MERCADO LIBRE", "MERCADO PAGO":"MERCADO LIBRE", "META":"META", "FACEBOOK":"META", "GOOGLE":"GOOGLE", "YPF":"YPF", "SHELL":"SHELL", "AXION":"AXION", "TELECOM":"TELECOM", "PERSONAL":"TELECOM", "MOVISTAR":"MOVISTAR", "CLARO":"CLARO", "EDESA":"EDESA", "GASNOR":"GASNOR", "BETA SERVICIO LIMPIEZA":"BETA SERVICIO LIMPIEZA", "ATIEMPO SEGURIDAD":"ATIEMPO SEGURIDAD", "CHANGO TRUCK":"CHANGO TRUCK"}
-    for k, v in reglas.items():
-        if k in p: return v
-    for q in ["ALQ LOC","ALQ LOCAL","MAYOR VALOR","MAR","FEB","ABR","ENE","NOCT","DIURNAS","MEJORAS","SOPORTE EVOLUTIVO","MANTENIMIENTO","ABONO","CUOTA","PAGO","FACTURA"]:
-        p = p.replace(q, " ")
-    palabras = [w for w in re.sub(r'\s+', ' ', p).strip().split(" ") if len(w) > 2]
-    return " ".join(palabras[:3]) if palabras else "SIN IDENTIFICAR"
+def _texto_limpio(x):
+    if pd.isna(x): return ""
+    return re.sub(r"\s+", " ", str(x)).strip()
 
-def extraer_proveedor(row):
-    texto = " ".join([str(row.get(c, "")) for c in ["Detalle 2", "des res", "Detalle"]]).upper()
-    factura = extraer_factura_texto(texto)
-    if factura and factura in texto: texto = texto[texto.find(factura)+len(factura):]
-    for b in ["FACTURA","RECIBO","COMP","COMPROBANTE","PAGO","PAGOS","TRANSFERENCIA","FC","FA","FB","NC","ND","CUIT","IVA","ARG","S.A.","SA","SRL","S.R.L.","LTDA","NRO","Nº","NUM","PESOS"]:
-        texto = texto.replace(b, " ")
-    texto = re.sub(r'\d+', ' ', texto); texto = re.sub(r'[-_/.,:;()]+', ' ', texto); texto = re.sub(r'\s+', ' ', texto).strip()
-    palabras = [p for p in texto.split(" ") if len(p) > 2]
-    proveedor = " ".join(palabras[:6]).strip() or "SIN IDENTIFICAR"
-    return normalizar_proveedor_nombre(proveedor)
+def _clave_texto(x):
+    texto = unicodedata.normalize("NFKD", _texto_limpio(x).upper())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"[^A-Z0-9]+", " ", texto).strip()
+
+ALIAS_PROVEEDORES = {
+    "LOZANO ROQUE JUAN": "ROQUE JUAN LOZANO", "ROQUE JUAN LOZANO": "ROQUE JUAN LOZANO",
+    "TOYOTA ARGENTINA": "TOYOTA ARGENTINA S.A.", "TOYOTA ENTINA": "TOYOTA ARGENTINA S.A.",
+    "OVERSOFT": "OVERSOFT S.A.", "ATIEMPO SEGURIDAD": "ATIEMPO SEGURIDAD S.R.L.",
+    "CHANGO TRUCK": "CHANGO TRUCK S.A.", "BETA SERVICIO LIMPIEZA": "BETA S.R.L.",
+    "BETA SRL": "BETA S.R.L.", "BETA S R L": "BETA S.R.L.", "EJESA": "EJESA",
+    "EDESA": "EDESA S.A.", "YPF": "YPF S.A.", "KAESER COMPRESORES": "KAESER COMPRESORES ARGENTINA",
+    "HABITAT ECOLOGICO": "HABITAT ECOLOGICO S.A.", "TELECOM ARGENTINA": "TELECOM ARGENTINA S.A.",
+    "WURTH ARGENTINA": "WURTH ARGENTINA S.A.", "MANGO360": "MANGO360 S.A.S.",
+    "MERCADO LIBRE": "MERCADO LIBRE", "MERCADOLIBRE": "MERCADO LIBRE",
+    "MERCADO PAGO": "MERCADO LIBRE", "LOGISTICA Y SERVICIOS": "LOGISTICA Y SERVICIOS AMBIENTALES",
+    "ANTONIO ATENOR E HIJOS": "ANTONIO B. ATENOR E HIJOS", "GASNOR": "GASNOR S.A.",
+}
+
+NO_PROVEEDOR = [
+    "ANUL REINTEGRO", "PRORRATEO", "MOV ", "LICENCIAS SALESFORCE", "SOPORTE EVOLUTIVO",
+    "DIFERENCIA RECLAMO", "EGRESOS DE CAJA", "INGRESOS DE CAJA", "SIN IDENTIFICAR",
+    "RESUMEN VISA", "DEV PRORRATEO", "CARGO INTERNO"
+]
+
+def normalizar_proveedor_nombre(proveedor):
+    """Consolida alias evidentes sin recortar la razón social."""
+    original = _texto_limpio(proveedor).upper().strip(" -.;,")
+    clave = _clave_texto(original)
+    for alias, canonico in ALIAS_PROVEEDORES.items():
+        if _clave_texto(alias) in clave: return canonico
+    return original if original else "PROVEEDOR NO IDENTIFICADO"
+
+def detectar_proveedor(row):
+    """Prioriza la razón social de la factura y evita confundir rendidores con proveedores."""
+    d2 = _texto_limpio(row.get("Detalle 2", ""))
+    des = _texto_limpio(row.get("des res", ""))
+    det = _texto_limpio(row.get("Detalle", ""))
+
+    for campo, fuente in [(des, "Descripción del asiento"), (det, "Detalle")]:
+        m = re.search(r"(?:F|FC|FA|FB)\s*:?\s*[A-Z]?\d{4,5}[- ]?\d{5,12}\s*[-:]\s*(.+)$", campo, flags=re.I)
+        if m:
+            candidato = m.group(1).strip(" -.;,")
+            if candidato: return normalizar_proveedor_nombre(candidato), fuente, "Alta"
+
+    if d2 and d2 not in {".", "-", "0"} and re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", d2):
+        clave = _clave_texto(d2)
+        es_codigo = re.fullmatch(r"(?:VI|MOV|OR|ORO|CR)\s*\d+", clave)
+        if not any(_clave_texto(marca) in clave for marca in NO_PROVEEDOR) and not es_codigo:
+            return normalizar_proveedor_nombre(d2), "Detalle 2", "Alta"
+
+    if "CAJA" in _clave_texto(des) or "RENDIC" in _clave_texto(det):
+        return "PROVEEDOR NO IDENTIFICADO — RENDICIÓN", "Rendición de caja", "Baja"
+    return "PROVEEDOR NO IDENTIFICADO", "Sin dato estructurado", "Baja"
+
+def extraer_proveedor(row): return detectar_proveedor(row)[0]
 
 def categoria_proveedor(proveedor, detalle):
     texto = f"{proveedor} {detalle}".upper()
-    reglas = {"Marketing digital":["META","GOOGLE","FACEBOOK","INSTAGRAM","ADS","PUBLICIDAD"], "Marketplace / plataformas":["MERCADO LIBRE","MERCADOLIBRE","MERCADO PAGO"], "Combustible / movilidad":["YPF","SHELL","AXION","COMBUSTIBLE","NAFTA","GASOIL"], "Telecomunicaciones":["TELECOM","PERSONAL","MOVISTAR","CLARO","INTERNET","TELEFONO"], "Energía / servicios":["EDESA","GASNOR","LUZ","GAS","AGUA","ENERGIA"], "Seguros":["SEGURO","SANCOR","FEDERACION","MAPFRE","ZURICH"], "Limpieza / seguridad":["LIMPIEZA","SEGURIDAD","VIGILANC","ATIEMPO"], "Toyota / terminal":["TOYOTA"], "Sistemas / software":["OVERSOFT","SIAC","SISTEMA","SOFTWARE"], "Alquileres":["LOZANO","ALQUILER","ALQ"], "Honorarios / profesionales":["HONORARIO","ESTUDIO","ASESOR","CONSULT"]}
+    reglas = {"Marketing digital":["META","GOOGLE","FACEBOOK","INSTAGRAM","ADS","PUBLICIDAD"], "Marketplace / plataformas":["MERCADO LIBRE","MERCADOLIBRE","MERCADO PAGO"], "Combustible / movilidad":["YPF","SHELL","AXION","COMBUSTIBLE","NAFTA","GASOIL"], "Telecomunicaciones":["TELECOM","PERSONAL","MOVISTAR","CLARO","INTERNET","TELEFONO"], "Energía / servicios":["EDESA","EJESA","GASNOR","LUZ","GAS","AGUA","ENERGIA"], "Seguros":["SEGURO","SANCOR","FEDERACION","MAPFRE","ZURICH","SWISS MEDICAL"], "Limpieza":["LIMPIEZA","BETA S.R.L","TAYKA"], "Seguridad":["SEGURIDAD","VIGILANC","ATIEMPO"], "Residuos / ambiente":["HABITAT ECOLOGICO","LOGISTICA Y SERVICIOS AMBIENTALES","RESIDUOS"], "Herramientas / mantenimiento":["KAESER","WURTH","VINCERE","COMPRESOR"], "Toyota / terminal":["TOYOTA"], "Sistemas / software":["OVERSOFT","SIAC","SISTEMA","SOFTWARE","SALESFORCE","MANGO360"], "Alquileres":["LOZANO","ALQUILER","ALQ","FIDEICOMISO"], "Honorarios / profesionales":["HONORARIO","ESTUDIO","ASESOR","CONSULT"]}
     for cat, keys in reglas.items():
         if any(k in texto for k in keys): return cat
     return "Otros / no clasificado"
@@ -238,10 +279,16 @@ def cargar_datos():
     for col in CENTROS_COSTO: df[f"{col}_Gestion"] = df[col] * df["Factor_signo"]
     df = df.merge(mapa_rubro_a_pnl(), on="Rubro_calc", how="left")
     df["Grupo_PNL"] = df["Grupo_PNL"].fillna("Sin clasificar"); df["Concepto_PNL"] = df["Concepto_PNL"].fillna("Sin clasificar"); df["Logica_PNL"] = df["Logica_PNL"].fillna("sin lógica")
-    df["Factura_detectada"] = df.apply(extraer_factura, axis=1)
-    df["Proveedor_detectado"] = df.apply(extraer_proveedor, axis=1)
+    registros = df[["Detalle", "des res", "Detalle 2"]].to_dict("records")
+    df["Factura_detectada"] = [extraer_factura(r) for r in registros]
+    proveedor_info = pd.DataFrame(
+        [detectar_proveedor(r) for r in registros],
+        columns=["Proveedor_detectado", "Proveedor_fuente", "Confianza_proveedor"],
+        index=df.index,
+    )
+    df[["Proveedor_detectado", "Proveedor_fuente", "Confianza_proveedor"]] = proveedor_info
     df["Texto_movimiento"] = df["Detalle"].astype(str) + " " + df["des res"].astype(str) + " " + df["Detalle 2"].astype(str)
-    df["Categoria_proveedor"] = df.apply(lambda r: categoria_proveedor(r["Proveedor_detectado"], r["Texto_movimiento"]), axis=1)
+    df["Categoria_proveedor"] = [categoria_proveedor(p, t) for p, t in zip(df["Proveedor_detectado"], df["Texto_movimiento"])]
     return df
 
 def preparar_costos(df, centros_sel, grupos, meses):
@@ -690,17 +737,141 @@ def styled_heatmap_percent(df_num):
     styler = df_display.style
     return styler.map(color_cell) if hasattr(styler, "map") else styler.applymap(color_cell)
 
+# ---------- Dirección 2.0 ----------
+def controlabilidad_concepto(concepto, grupo):
+    alta = ["Publicidad y Promoción", "Movilidad y Viáticos", "Útiles y materiales de oficina",
+            "Teléfonos e internet", "Serv. Limpieza", "Herramientas, materiales y fletes",
+            "Otros Gastos Fijos", "Gastos de Atención clientes", "Mantenimiento rodados y equipos",
+            "Mantenimiento Bienes de Uso", "Seguridad y vigilancia", "Servicios gratuitos y Cargos internos"]
+    media = ["Alquileres", "Honorarios profesionales", "Seguros", "Fuerza motriz, luz, agua y gas"]
+    if concepto in alta: return "Alta"
+    if concepto in media: return "Media / negociable"
+    if grupo == "Costos No Controlables": return "Baja"
+    return "Media"
+
+def accion_recomendada(concepto, controlabilidad):
+    reglas = {
+        "Publicidad y Promoción": "Exigir objetivo, campaña y retorno; pausar acciones sin resultado medible.",
+        "Movilidad y Viáticos": "Abrir viajes y combustible; validar necesidad, frecuencia, autorización y rendición.",
+        "Útiles y materiales de oficina": "Definir cupos por sector, centralizar pedidos y evitar compras extraordinarias.",
+        "Teléfonos e internet": "Revisar líneas, planes, usuarios activos y servicios duplicados.",
+        "Serv. Limpieza": "Separar servicio e insumos; controlar frecuencia, consumo y precio por unidad.",
+        "Herramientas, materiales y fletes": "Abrir por artículo/flete; comparar cotizaciones, urgencias y stock disponible.",
+        "Otros Gastos Fijos": "Reclasificar conceptos y exigir autorización para gastos no recurrentes.",
+        "Gastos de Atención clientes": "Definir presupuesto, motivo y costo por atención; controlar excepciones.",
+        "Mantenimiento rodados y equipos": "Aplicar mantenimiento preventivo, tres cotizaciones y seguimiento por unidad.",
+        "Mantenimiento Bienes de Uso": "Abrir por activo y trabajo; validar urgencia, recurrencia y presupuesto.",
+        "Seguridad y vigilancia": "Revisar horas cubiertas, adicionales, tarifa y alcance contractual.",
+        "Servicios gratuitos y Cargos internos": "Abrir por orden, causa y responsable; limitar autorizaciones excepcionales.",
+        "Alquileres": "Revisar cláusulas, ajustes y ocupación; renegociar cuando venza el contrato.",
+        "Honorarios profesionales": "Validar entregables, recurrencia, tarifa y superposición de servicios.",
+        "Seguros": "Comparar cobertura, siniestralidad, franquicias y cotizaciones alternativas.",
+        "Fuerza motriz, luz, agua y gas": "Separar consumo y tarifa; revisar distribución, potencia y medidas de eficiencia.",
+        "Impuestos": "Validar base, imputación y recuperos posibles; no tratar como recorte operativo.",
+        "Impuestos y tasas": "Validar base, imputación y recuperos posibles; no tratar como recorte operativo.",
+        "Amortizaciones": "Monitorear e identificar altas/bajas de activos; no tratar como ahorro de caja inmediato.",
+    }
+    if concepto in reglas: return reglas[concepto]
+    if controlabilidad == "Baja": return "Monitorear y validar imputación; buscar optimización indirecta."
+    if controlabilidad == "Media / negociable": return "Revisar contrato, alcance, tarifa y condiciones de renovación."
+    return "Abrir movimientos, recurrencia y proveedor; definir responsable y próxima acción."
+
+def hipotesis_desvio(concepto, variacion, anterior, actual):
+    if anterior == 0 and actual > 0: return "Gasto nuevo o sin movimiento en el mes anterior."
+    if variacion < 0: return "Mejora observada: validar ahorro real, estacionalidad o diferimiento de factura."
+    texto = concepto.lower()
+    if any(k in texto for k in ["mantenimiento", "herramientas", "fletes", "otros gastos"]):
+        return "Posible compra o reparación extraordinaria; revisar movimientos de mayor importe."
+    if any(k in texto for k in ["limpieza", "seguridad", "alquiler", "teléfono", "luz", "agua", "gas"]):
+        return "Posible cambio de tarifa, alcance, consumo o período facturado."
+    if any(k in texto for k in ["atención", "movilidad", "publicidad", "servicios gratuitos"]):
+        return "Posible aumento de frecuencia, autorizaciones o actividad puntual."
+    return "Revisar importe, frecuencia, proveedor e imputación contable."
+
+def construir_matriz_direccion(base):
+    matriz = tabla_variaciones(base, ["Grupo_PNL", "Concepto_PNL"])
+    meses = sorted(base["Mes"].dropna().unique())
+    if not meses: return matriz
+    actual = meses[-1]
+    historicos = meses[:-1]
+    if historicos:
+        hist_mes = base[base["Mes"].isin(historicos)].groupby(["Grupo_PNL", "Concepto_PNL", "Mes"], as_index=False)["Importe_CC"].sum()
+        hist = hist_mes.groupby(["Grupo_PNL", "Concepto_PNL"])["Importe_CC"].mean().rename("Promedio histórico").reset_index()
+        matriz = matriz.merge(hist, on=["Grupo_PNL", "Concepto_PNL"], how="left")
+    else: matriz["Promedio histórico"] = np.nan
+    matriz["Promedio histórico"] = matriz["Promedio histórico"].fillna(0)
+    matriz["Desvío vs promedio"] = matriz["Mes actual"] - matriz["Promedio histórico"]
+    matriz["Controlabilidad"] = [controlabilidad_concepto(c, g) for c, g in zip(matriz["Concepto_PNL"], matriz["Grupo_PNL"])]
+    matriz["Hipótesis"] = [hipotesis_desvio(c, v, a, x) for c, v, a, x in zip(matriz["Concepto_PNL"], matriz["Variación $"], matriz["Mes anterior"], matriz["Mes actual"])]
+    matriz["Acción recomendada"] = [accion_recomendada(c, ctrl) for c, ctrl in zip(matriz["Concepto_PNL"], matriz["Controlabilidad"])]
+    matriz["Prioridad"] = np.select(
+        [
+            (matriz["Variación $"] > 0) & matriz["Severidad"].isin(["🔴 Crítico", "🟠 Alto"]) & matriz["Controlabilidad"].ne("Baja"),
+            (matriz["Variación $"] > 0) & matriz["Controlabilidad"].ne("Baja"),
+            (matriz["Variación $"] < 0),
+            matriz["Controlabilidad"].eq("Baja"),
+        ],
+        ["1 · Actuar", "2 · Revisar", "4 · Validar mejora", "3 · Monitorear"],
+        default="3 · Monitorear"
+    )
+    matriz["Var_pct_visual"] = matriz["Variación %"].clip(-2, 2).fillna(0)
+    matriz["Tamaño"] = matriz["Impacto_abs"].clip(lower=1)
+    return matriz.sort_values(["Prioridad", "Impacto_abs"], ascending=[True, False])
+
+def aplicar_estilo_figura(fig, altura=390):
+    fig.update_layout(
+        height=altura, margin=dict(l=15, r=15, t=55, b=15),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, Arial", color="#263238"),
+        title_font=dict(size=17, color="#173A2B"), legend_title_text=""
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#E8EEE9", zerolinecolor="#B7C7BD")
+    fig.update_yaxes(showgrid=False, zerolinecolor="#B7C7BD")
+    return fig
+
+def tarjeta_kpi(titulo, valor, detalle="", tono="neutro"):
+    colores = {"bien": ("#E8F5EE", "#0B6B3A"), "mal": ("#FDECEC", "#B42318"), "alerta": ("#FFF6DF", "#9A6700"), "neutro": ("#F3F6F4", "#173A2B")}
+    fondo, color = colores.get(tono, colores["neutro"])
+    st.markdown(f"""
+    <div class="lux-kpi" style="background:{fondo};">
+      <div class="lux-kpi-title">{titulo}</div>
+      <div class="lux-kpi-value" style="color:{color};">{valor}</div>
+      <div class="lux-kpi-detail">{detalle}</div>
+    </div>""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
-h1 {font-weight: 800; color: #1f2a44;}
-h2, h3 {color: #1f2a44;}
-[data-testid="stMetricValue"] {font-size: 26px;}
-.block-container {padding-top: 1.4rem;}
+:root {--lux-green:#0B6B3A; --lux-dark:#173A2B; --lux-soft:#E8F5EE; --lux-line:#DCE7E0;}
+.stApp {background: linear-gradient(180deg, #F7FAF8 0%, #FFFFFF 280px);}
+.block-container {padding-top: 1.15rem; padding-bottom: 3rem; max-width: 1550px;}
+h1 {font-weight: 800 !important; color: var(--lux-dark) !important; letter-spacing:-0.03em;}
+h2, h3 {color: var(--lux-dark) !important; letter-spacing:-0.015em;}
+[data-testid="stSidebar"] {background:#F2F7F4; border-right:1px solid var(--lux-line);}
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {color:var(--lux-green) !important;}
+[data-testid="stMetric"] {background:#FFFFFF; border:1px solid var(--lux-line); padding:16px 18px; border-radius:16px; box-shadow:0 5px 18px rgba(20,60,40,.05);}
+[data-testid="stMetricValue"] {font-size:25px; color:var(--lux-dark); font-weight:750;}
+[data-testid="stMetricDelta"] {font-size:13px;}
+[data-baseweb="tab-list"] {gap:6px; overflow-x:auto; padding-bottom:6px;}
+[data-baseweb="tab"] {height:42px; border-radius:12px 12px 0 0; padding:0 14px; white-space:nowrap;}
+[aria-selected="true"][data-baseweb="tab"] {background:#E8F5EE; color:#0B6B3A; font-weight:700;}
+.lux-kpi {min-height:122px; border-radius:18px; padding:18px 20px; border:1px solid rgba(11,107,58,.10); box-shadow:0 7px 22px rgba(20,60,40,.06);}
+.lux-kpi-title {font-size:12px; font-weight:750; text-transform:uppercase; letter-spacing:.055em; color:#597065;}
+.lux-kpi-value {font-size:29px; line-height:1.2; font-weight:820; margin-top:8px; letter-spacing:-.035em;}
+.lux-kpi-detail {font-size:12px; color:#66756D; margin-top:7px; line-height:1.35;}
+.lux-hero {background:linear-gradient(135deg,#0B6B3A 0%,#174F36 100%); color:white; border-radius:22px; padding:25px 28px; margin-bottom:18px; box-shadow:0 12px 30px rgba(11,107,58,.16);}
+.lux-hero h2 {color:white !important; margin:0; font-size:27px;}
+.lux-hero p {margin:8px 0 0 0; color:#DCEFE4; font-size:14px;}
+.lux-section {font-size:17px; font-weight:800; color:#173A2B; margin:17px 0 8px; padding-left:11px; border-left:4px solid #0B6B3A;}
+.lux-note {background:#EFF7F2; border:1px solid #D6E9DD; border-radius:14px; padding:14px 16px; color:#274B38; line-height:1.45;}
+.lux-alert {background:#FFF6DF; border:1px solid #F0D99B; border-radius:14px; padding:14px 16px; color:#6D5200;}
+div[data-testid="stDataFrame"] {border:1px solid var(--lux-line); border-radius:14px; overflow:hidden;}
+div[data-testid="stPlotlyChart"] {background:#FFFFFF; border:1px solid var(--lux-line); border-radius:18px; padding:7px; box-shadow:0 5px 18px rgba(20,60,40,.04);}
+.stDownloadButton button, .stButton button {border-radius:12px; border-color:#9AC5AA;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 Dashboard Mayores Contables LUX")
-st.caption("Control de costos, alertas, proveedores, benchmark, cuentas contables, insights y drilldown.")
+st.title("Mayores Contables · Gestión de Gastos")
+st.caption("De la variación contable a la decisión: evolución, desvíos, causas y acciones recomendadas.")
 
 try: df = cargar_datos()
 except Exception as e:
@@ -708,15 +879,182 @@ except Exception as e:
 if df.empty: st.warning("La base está vacía."); st.stop()
 
 with st.sidebar:
-    st.header("Filtros generales")
+    st.header("Alcance general")
     sucursales = sorted(df["Sucursal"].dropna().astype(str).unique())
-    suc_sel = st.multiselect("Sucursal", sucursales, default=sucursales)
+    suc_sel = st.multiselect("Sucursal", sucursales, default=sucursales, help="Este filtro se aplica a todas las vistas del tablero.")
+    st.caption("Los filtros específicos de centro, costo y período aparecen dentro de cada vista.")
 
 df_filtrado = df[df["Sucursal"].isin(suc_sel)].copy() if suc_sel else df.copy()
 meses_all = sorted(df_filtrado["Mes"].dropna().unique())
 centros_base = centros_disponibles(df_filtrado)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["🎯 Control de Costos", "🚨 Alertas & Insights", "💼 Reducción de Gastos", "💰 Oportunidades de Ahorro", "🏭 Proveedores", "🏢 Benchmark Sucursales", "📑 P&L", "📒 Cuentas contables", "🧾 Control signos", "🔎 Drilldown", "⚙️ Diccionario"])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["🧭 Dirección 2.0", "📈 Evolución", "🚨 Desvíos", "💼 Reducción", "💰 Oportunidades", "🏭 Proveedores", "🏢 Sucursales", "📑 P&L", "📒 Cuentas", "🧾 Signos", "🔎 Movimientos", "⚙️ Modelo"])
+
+with tab0:
+    st.markdown("""
+    <div class="lux-hero">
+      <h2>Centro de decisión de gastos</h2>
+      <p>Una sola vista para entender qué cambió, dónde está el desvío, qué lo explica y cuál es la próxima acción recomendada.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    f1, f2, f3, f4 = st.columns([1.35, 1.2, 1.05, 1.05])
+    with f1:
+        centros_dir = st.multiselect(
+            "Centro de costo", centros_base,
+            default=default_centros(centros_base, "posventa"), key="dir_centros"
+        )
+    with f2:
+        grupos_dir = st.multiselect(
+            "Tipo de costo", ["Costos Controlables", "Costos No Controlables"],
+            default=["Costos Controlables", "Costos No Controlables"], key="dir_grupos"
+        )
+    with f3:
+        ventana_dir = st.selectbox(
+            "Período", ["Últimos 3 meses", "Últimos 6 meses", "Todo el período", "Selección manual"],
+            index=1, key="dir_ventana"
+        )
+    with f4:
+        escenario_ahorro = st.slider("Escenario selectivo", 3, 15, 5, 1, format="%d%%", key="dir_ahorro")
+
+    if ventana_dir == "Últimos 3 meses": meses_dir = meses_all[-3:]
+    elif ventana_dir == "Últimos 6 meses": meses_dir = meses_all[-6:]
+    elif ventana_dir == "Todo el período": meses_dir = meses_all
+    else:
+        meses_dir = st.multiselect("Meses a comparar", meses_all, default=meses_all[-4:], key="dir_meses_manual")
+
+    base_dir = preparar_costos(df_filtrado, centros_dir, grupos_dir, meses_dir)
+
+    if not centros_dir:
+        st.warning("Seleccioná al menos un centro de costo.")
+    elif len(meses_dir) < 2:
+        st.warning("Seleccioná al menos dos meses para calcular desvíos.")
+    elif base_dir.empty:
+        st.info("No hay movimientos para los filtros seleccionados.")
+    else:
+        meses_dir_ord = sorted(base_dir["Mes"].dropna().unique())
+        mes_act, mes_ant = meses_dir_ord[-1], meses_dir_ord[-2]
+        total_act = base_dir.loc[base_dir["Mes"] == mes_act, "Importe_CC"].sum()
+        total_ant = base_dir.loc[base_dir["Mes"] == mes_ant, "Importe_CC"].sum()
+        var_total = total_act - total_ant
+        var_pct_total = var_total / abs(total_ant) if total_ant else np.nan
+        matriz_dir = construir_matriz_direccion(base_dir)
+        alertas_dir = matriz_dir[matriz_dir["Prioridad"] == "1 · Actuar"]
+        controlables_act = base_dir.loc[(base_dir["Mes"] == mes_act) & (base_dir["Grupo_PNL"] == "Costos Controlables"), "Importe_CC"].sum()
+        base_accionable = matriz_dir[matriz_dir["Controlabilidad"].isin(["Alta", "Media / negociable", "Media"])]
+        ahorro_escenario = base_accionable["Mes actual"].clip(lower=0).sum() * escenario_ahorro / 100
+        presiones = matriz_dir[matriz_dir["Variación $"] > 0].sort_values("Variación $", ascending=False)
+        mejoras = matriz_dir[matriz_dir["Variación $"] < 0].sort_values("Variación $")
+
+        tono_var = "mal" if var_total > 0 else "bien" if var_total < 0 else "neutro"
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1: tarjeta_kpi(f"Gasto {mes_act}", fmt_money(total_act), f"{label_centros(centros_dir)} · {', '.join(grupos_dir)}")
+        with k2: tarjeta_kpi("Variación mensual", fmt_money(var_total), f"{fmt_pct(var_pct_total)} frente a {mes_ant}", tono_var)
+        with k3: tarjeta_kpi("Costos controlables", fmt_money(controlables_act), f"Participación {fmt_pct(controlables_act / total_act if total_act else np.nan)}")
+        with k4: tarjeta_kpi("Focos para actuar", str(len(alertas_dir)), "Desvíos altos y accionables", "mal" if len(alertas_dir) else "bien")
+        with k5: tarjeta_kpi(f"Escenario ahorro {escenario_ahorro}%", fmt_money(ahorro_escenario), "Simulación sobre gastos accionables", "alerta")
+
+        st.markdown('<div class="lux-section">Lectura ejecutiva</div>', unsafe_allow_html=True)
+        lectura = []
+        if var_total > 0:
+            lectura.append(f"El gasto **aumentó {fmt_money(var_total)} ({fmt_pct(var_pct_total)})** respecto de {mes_ant}.")
+        elif var_total < 0:
+            lectura.append(f"El gasto **bajó {fmt_money(abs(var_total))} ({fmt_pct(abs(var_pct_total))})** respecto de {mes_ant}; debe validarse si es ahorro real o diferimiento.")
+        else: lectura.append("El gasto se mantuvo sin variaciones relevantes frente al mes anterior.")
+        if not presiones.empty:
+            a = presiones.iloc[0]
+            lectura.append(f"La principal presión es **{a['Concepto_PNL']}**, con una suba de **{fmt_money(a['Variación $'])}**.")
+        if not mejoras.empty:
+            m = mejoras.iloc[0]
+            lectura.append(f"La principal mejora es **{m['Concepto_PNL']}**, con una baja de **{fmt_money(abs(m['Variación $']))}**.")
+        st.markdown(f'<div class="lux-note">{" ".join(lectura)}</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="lux-section">Evolución y explicación del último desvío</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns([1.05, 1])
+        with c1:
+            evolucion = []
+            for centro in centros_dir:
+                col = f"{centro}_Gestion"
+                if col in df_filtrado.columns:
+                    tmp = df_filtrado[(df_filtrado["Mes"].isin(meses_dir_ord)) & (df_filtrado["Grupo_PNL"].isin(grupos_dir))].groupby("Mes", as_index=False)[col].sum()
+                    tmp["Centro"] = centro; tmp = tmp.rename(columns={col: "Importe"}); evolucion.append(tmp)
+            evo_dir = pd.concat(evolucion, ignore_index=True) if evolucion else pd.DataFrame()
+            if not evo_dir.empty:
+                fig_evo = px.line(evo_dir, x="Mes", y="Importe", color="Centro", markers=True,
+                                  color_discrete_sequence=["#0B6B3A", "#1F77B4", "#D98C10", "#7B61A8"],
+                                  title="Evolución mensual por centro de costo")
+                fig_evo.update_traces(line=dict(width=3), marker=dict(size=8))
+                fig_evo.update_yaxes(tickprefix="$ ", separatethousands=True)
+                aplicar_estilo_figura(fig_evo, 405); st.plotly_chart(fig_evo, use_container_width=True)
+        with c2:
+            puente = matriz_dir.dropna(subset=["Variación $"]).sort_values("Impacto_abs", ascending=False).head(12).copy()
+            puente = puente.sort_values("Variación $")
+            puente["Lectura"] = np.where(puente["Variación $"] > 0, "Aumenta gasto", "Reduce gasto")
+            puente["Etiqueta"] = puente["Variación $"].apply(fmt_money_short)
+            fig_puente = px.bar(
+                puente, x="Variación $", y="Concepto_PNL", orientation="h", color="Lectura", text="Etiqueta",
+                color_discrete_map={"Aumenta gasto":"#D64545", "Reduce gasto":"#1D8A55"},
+                title=f"Rubros que explican {mes_ant} → {mes_act}"
+            )
+            fig_puente.update_traces(textposition="outside", cliponaxis=False)
+            aplicar_estilo_figura(fig_puente, 405); st.plotly_chart(fig_puente, use_container_width=True)
+
+        st.markdown('<div class="lux-section">Mapa de atención: monto, variación y capacidad de acción</div>', unsafe_allow_html=True)
+        mapa = matriz_dir[matriz_dir["Mes actual"].abs() > 0].copy()
+        mapa["Gasto actual"] = mapa["Mes actual"].abs()
+        if not mapa.empty:
+            fig_mapa = px.scatter(
+                mapa, x="Var_pct_visual", y="Gasto actual", size="Tamaño", color="Prioridad",
+                hover_name="Concepto_PNL", hover_data={"Variación $":":,.0f", "Variación %":":.1%", "Promedio histórico":":,.0f", "Controlabilidad":True, "Hipótesis":True, "Acción recomendada":True, "Var_pct_visual":False, "Tamaño":False},
+                color_discrete_map={"1 · Actuar":"#C62828", "2 · Revisar":"#E38B16", "3 · Monitorear":"#607D8B", "4 · Validar mejora":"#16834B"},
+                title="Arriba y a la derecha: gasto alto que además crece"
+            )
+            fig_mapa.add_vline(x=0, line_dash="dash", line_color="#9BAAA1")
+            fig_mapa.update_xaxes(tickformat=".0%", title="Variación vs mes anterior (acotada a ±200%)")
+            fig_mapa.update_yaxes(tickprefix="$ ", title="Gasto actual")
+            aplicar_estilo_figura(fig_mapa, 455); st.plotly_chart(fig_mapa, use_container_width=True)
+
+        st.markdown('<div class="lux-section">Agenda priorizada de trabajo</div>', unsafe_allow_html=True)
+        plan = matriz_dir.copy().sort_values(["Prioridad", "Impacto_abs"], ascending=[True, False])
+        plan_mostrar = plan[["Prioridad", "Concepto_PNL", "Grupo_PNL", "Controlabilidad", "Mes anterior", "Mes actual", "Variación $", "Variación %", "Promedio histórico", "Desvío vs promedio", "Hipótesis", "Acción recomendada"]].head(20)
+        st.dataframe(
+            plan_mostrar, use_container_width=True, height=510, hide_index=True,
+            column_config={
+                "Mes anterior": st.column_config.NumberColumn(format="$ %.0f"), "Mes actual": st.column_config.NumberColumn(format="$ %.0f"),
+                "Variación $": st.column_config.NumberColumn(format="$ %.0f"), "Variación %": st.column_config.NumberColumn(format="percent"),
+                "Promedio histórico": st.column_config.NumberColumn(format="$ %.0f"), "Desvío vs promedio": st.column_config.NumberColumn(format="$ %.0f"),
+            }
+        )
+
+        st.markdown('<div class="lux-section">Explicar un desvío</div>', unsafe_allow_html=True)
+        opciones_dir = plan["Concepto_PNL"].dropna().tolist()
+        concepto_dir = st.selectbox("Seleccioná el rubro que querés explicar", opciones_dir, key="dir_concepto")
+        detalle_dir = base_dir[base_dir["Concepto_PNL"] == concepto_dir].copy()
+        if not detalle_dir.empty:
+            fila_dir = plan[plan["Concepto_PNL"] == concepto_dir].iloc[0]
+            st.markdown(f"""
+            <div class="lux-alert"><b>Diagnóstico inicial:</b> {fila_dir['Hipótesis']}<br>
+            <b>Próxima acción recomendada:</b> {fila_dir['Acción recomendada']}</div>
+            """, unsafe_allow_html=True)
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                cuentas_d = detalle_dir.groupby("Nombre cuenta", as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False).head(8)
+                fig = px.bar(cuentas_d.sort_values("Importe_CC"), x="Importe_CC", y="Nombre cuenta", orientation="h", title="Cuentas que concentran el gasto", color_discrete_sequence=["#0B6B3A"])
+                aplicar_estilo_figura(fig, 340); st.plotly_chart(fig, use_container_width=True)
+            with d2:
+                prov_d = detalle_dir[detalle_dir.get("Confianza_proveedor", "Alta") == "Alta"] if "Confianza_proveedor" in detalle_dir.columns else detalle_dir
+                prov_d = prov_d.groupby("Proveedor_detectado", as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False).head(8)
+                fig = px.bar(prov_d.sort_values("Importe_CC"), x="Importe_CC", y="Proveedor_detectado", orientation="h", title="Proveedores/contrapartes", color_discrete_sequence=["#2D7FB8"])
+                aplicar_estilo_figura(fig, 340); st.plotly_chart(fig, use_container_width=True)
+            with d3:
+                suc_d = detalle_dir.groupby("Sucursal", as_index=False)["Importe_CC"].sum().sort_values("Importe_CC", ascending=False).head(8)
+                fig = px.bar(suc_d, x="Sucursal", y="Importe_CC", title="Dónde se registra", color_discrete_sequence=["#D98C10"])
+                fig.update_xaxes(tickangle=-30); aplicar_estilo_figura(fig, 340); st.plotly_chart(fig, use_container_width=True)
+
+            with st.expander("Ver movimientos que explican el rubro"):
+                mov_dir = detalle_dir.copy(); mov_dir["Impacto_abs"] = mov_dir["Importe_CC"].abs(); mov_dir = mov_dir.sort_values("Impacto_abs", ascending=False)
+                cols_dir = ["Mes", "Fecha", "Sucursal", "Cuenta:", "Nombre cuenta", "Proveedor_detectado", "Proveedor_fuente", "Confianza_proveedor", "Detalle", "des res", "Detalle 2", "Importe_CC"]
+                st.dataframe(mov_dir[[c for c in cols_dir if c in mov_dir.columns]].head(200), use_container_width=True, height=430, hide_index=True)
 
 with tab1:
     st.subheader("🎯 Control de costos controlables y no controlables")
@@ -1548,3 +1886,4 @@ Este tab separa gastos de baja accionabilidad (alquileres, licencias Toyota, Ove
 ### 6. Cuentas contables
 Permite ver número de cuenta, nombre, rubro+subrubro, categoría, importe mensual, evolución, severidad y movimientos explicativos.
 """)
+
