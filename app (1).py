@@ -274,9 +274,9 @@ def cargar_datos():
     df.columns = [str(c).strip() for c in df.columns]
     if len(df.columns) < 26:
         raise ValueError("La base no contiene las columnas Q:Z requeridas para controlar la imputación.")
-    porcentajes_qz = df.iloc[:, 16:26].copy()
-    for posicion, campo_interno in enumerate(IMPUTACION_PCT_INTERNAS):
-        df[campo_interno] = porcentajes_qz.iloc[:, posicion].apply(limpiar_porcentaje)
+    porcentajes_qz = df.iloc[:, 16:26].apply(pd.to_numeric, errors="coerce").fillna(0)
+    porcentajes_qz.columns = IMPUTACION_PCT_INTERNAS
+    df[IMPUTACION_PCT_INTERNAS] = porcentajes_qz
     if "Fecha" in df.columns:
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
         df["Mes"] = df["Fecha"].dt.to_period("M").astype(str)
