@@ -13,6 +13,12 @@ CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 CENTROS_COSTO = ["Vtas 0 Km", "Vtas Usado", "PPAA", "Repuestos", "Tl. Mec.", "Finanzas", "Mayorista", "ChapyPintu", "Central", "Administr."]
 CENTROS_POSVENTA = ["Repuestos", "Tl. Mec.", "Mayorista", "ChapyPintu"]
 
+# Columnas físicas Q:Z del mayor: porcentajes originales de imputación.
+# Se copian a campos internos al cargar la base para no confundirlas con
+# columnas posteriores que pueden repetir nombres y contener importes.
+IMPUTACION_PCT_ETIQUETAS = ["Vtas 0 Km", "Vtas Usado", "PPAA", "Repuestos", "Tl. Mec.", "KINTO", "Mayorista", "ChapyPintu", "Central", "Administr."]
+IMPUTACION_PCT_INTERNAS = [f"__Pct_QZ_{i}" for i in range(10)]
+
 SIGNO_RUBRO = {
     "VENTAS":"-", "INCENTIVOS":"-", "COMIS. P/VTA DIRECTA":"-", "INGRESO EXTRAORDIN":"-",
     "OTROS ING FINANCIERO":"-", "INGRESOS SEGUROS":"-", "COMIS CONSIGNACIONES":"-", "SOBRANTES DE INV.":"-",
@@ -73,6 +79,16 @@ def limpiar_numero(x):
     if pd.isna(x): return 0.0
     if isinstance(x, (int, float, np.number)): return float(x)
     s = str(x).strip().replace("$", "").replace(" ", "").replace("\xa0", "")
+    if s == "": return 0.0
+    if "," in s and "." in s: s = s.replace(".", "").replace(",", ".")
+    elif "," in s: s = s.replace(",", ".")
+    try: return float(s)
+    except Exception: return 0.0
+
+def limpiar_porcentaje(x):
+    if pd.isna(x): return 0.0
+    if isinstance(x, (int, float, np.number)): return float(x)
+    s = str(x).strip().replace("%", "").replace(" ", "").replace("\xa0", "")
     if s == "": return 0.0
     if "," in s and "." in s: s = s.replace(".", "").replace(",", ".")
     elif "," in s: s = s.replace(",", ".")
@@ -256,6 +272,11 @@ def campo_centros_gestion(df, centros_sel):
 def cargar_datos():
     df = pd.read_csv(CSV_URL)
     df.columns = [str(c).strip() for c in df.columns]
+    if len(df.columns) < 26:
+        raise ValueError("La base no contiene las columnas Q:Z requeridas para controlar la imputación.")
+    porcentajes_qz = df.iloc[:, 16:26].copy()
+    for posicion, campo_interno in enumerate(IMPUTACION_PCT_INTERNAS):
+        df[campo_interno] = porcentajes_qz.iloc[:, posicion].apply(limpiar_porcentaje)
     if "Fecha" in df.columns:
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
         df["Mes"] = df["Fecha"].dt.to_period("M").astype(str)
@@ -297,19 +318,21 @@ def preparar_costos(df, centros_sel, grupos, meses):
     return base[base["Importe_CC"] != 0].copy()
 
 def auditar_imputacion_horizontal(df, tolerancia=0.0001):
-    """Devuelve únicamente filas cuya suma de porcentajes por centro supera 100%."""
-    centros = [c for c in CENTROS_COSTO if c in df.columns]
+    """Controla exclusivamente los porcentajes originales de las columnas Q:Z."""
+    campos = [c for c in IMPUTACION_PCT_INTERNAS if c in df.columns]
     control = df.copy()
-    if not centros:
+    if len(campos) != 10:
         control["Suma imputación %"] = 0.0
         control["Exceso %"] = 0.0
-        return control.iloc[0:0], centros
-    porcentajes = control[centros].apply(pd.to_numeric, errors="coerce").fillna(0)
-    control[centros] = porcentajes
+        return control.iloc[0:0], []
+    porcentajes = control[campos].apply(pd.to_numeric, errors="coerce").fillna(0)
+    for etiqueta, campo in zip(IMPUTACION_PCT_ETIQUETAS, campos):
+        control[f"Imputación · {etiqueta}"] = porcentajes[campo]
     control["Suma imputación %"] = porcentajes.sum(axis=1)
     control["Exceso %"] = control["Suma imputación %"] - 100
     control = control[control["Suma imputación %"] > 100 + tolerancia].copy()
-    return control.sort_values(["Mes", "Suma imputación %"], ascending=[False, False]), centros
+    columnas_mostrar = [f"Imputación · {x}" for x in IMPUTACION_PCT_ETIQUETAS]
+    return control.sort_values(["Mes", "Suma imputación %"], ascending=[False, False]), columnas_mostrar
 
 def tabla_variaciones(base, index_cols):
     meses = sorted(base["Mes"].dropna().unique())
@@ -1862,7 +1885,7 @@ with tab10:
 
 with tab11:
     st.subheader("⚠️ Imputaciones horizontales superiores al 100%")
-    st.caption("Control por renglón: suma los porcentajes asignados a todos los centros de costos y muestra únicamente las filas que superan el 100%.")
+    st.caption("Control por renglón sobre las columnas físicas Q:Z del mayor. Suma únicamente los porcentajes originales de imputación y muestra las filas que superan el 100%.")
 
     meses_auditoria = sorted(df_filtrado["Mes"].dropna().unique(), reverse=True)
     mes_auditoria = st.selectbox(
