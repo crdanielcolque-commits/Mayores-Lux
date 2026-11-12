@@ -296,6 +296,21 @@ def preparar_costos(df, centros_sel, grupos, meses):
     base["Importe_CC"] = campo_centros_gestion(base, centros_sel)
     return base[base["Importe_CC"] != 0].copy()
 
+def auditar_imputacion_horizontal(df, tolerancia=0.0001):
+    """Devuelve únicamente filas cuya suma de porcentajes por centro supera 100%."""
+    centros = [c for c in CENTROS_COSTO if c in df.columns]
+    control = df.copy()
+    if not centros:
+        control["Suma imputación %"] = 0.0
+        control["Exceso %"] = 0.0
+        return control.iloc[0:0], centros
+    porcentajes = control[centros].apply(pd.to_numeric, errors="coerce").fillna(0)
+    control[centros] = porcentajes
+    control["Suma imputación %"] = porcentajes.sum(axis=1)
+    control["Exceso %"] = control["Suma imputación %"] - 100
+    control = control[control["Suma imputación %"] > 100 + tolerancia].copy()
+    return control.sort_values(["Mes", "Suma imputación %"], ascending=[False, False]), centros
+
 def tabla_variaciones(base, index_cols):
     meses = sorted(base["Mes"].dropna().unique())
     piv = base.pivot_table(index=index_cols, columns="Mes", values="Importe_CC", aggfunc="sum", fill_value=0).reset_index()
@@ -888,7 +903,7 @@ df_filtrado = df[df["Sucursal"].isin(suc_sel)].copy() if suc_sel else df.copy()
 meses_all = sorted(df_filtrado["Mes"].dropna().unique())
 centros_base = centros_disponibles(df_filtrado)
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["🧭 Dirección 2.0", "📈 Evolución", "🚨 Desvíos", "💼 Reducción", "💰 Oportunidades", "🏭 Proveedores", "🏢 Sucursales", "📑 P&L", "📒 Cuentas", "🧾 Signos", "🔎 Movimientos", "⚙️ Modelo"])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs(["🧭 Dirección 2.0", "📈 Evolución", "🚨 Desvíos", "💼 Reducción", "💰 Oportunidades", "🏭 Proveedores", "🏢 Sucursales", "📑 P&L", "📒 Cuentas", "🧾 Signos", "🔎 Movimientos", "⚠️ Imputaciones >100%", "⚙️ Modelo"])
 
 with tab0:
     st.markdown("""
@@ -1846,6 +1861,72 @@ with tab10:
     st.download_button("⬇️ Descargar drilldown filtrado", data=drill.to_csv(index=False).encode("utf-8-sig"), file_name="drilldown_mayores_lux.csv", mime="text/csv")
 
 with tab11:
+    st.subheader("⚠️ Imputaciones horizontales superiores al 100%")
+    st.caption("Control por renglón: suma los porcentajes asignados a todos los centros de costos y muestra únicamente las filas que superan el 100%.")
+
+    meses_auditoria = sorted(df_filtrado["Mes"].dropna().unique(), reverse=True)
+    mes_auditoria = st.selectbox(
+        "Mes a revisar",
+        ["Todos los meses"] + meses_auditoria,
+        key="mes_auditoria_imputacion",
+    )
+    base_auditoria = df_filtrado if mes_auditoria == "Todos los meses" else df_filtrado[df_filtrado["Mes"] == mes_auditoria]
+    sospechosos, centros_auditoria = auditar_imputacion_horizontal(base_auditoria)
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Renglones revisados", f"{len(base_auditoria):,}".replace(",", "."))
+    a2.metric("Renglones superiores al 100%", f"{len(sospechosos):,}".replace(",", "."))
+    maximo_imputado = sospechosos["Suma imputación %"].max() if not sospechosos.empty else 0
+    a3.metric("Máxima imputación detectada", f"{maximo_imputado:.1f}%")
+
+    if sospechosos.empty:
+        st.success("No se encontraron renglones cuya sumatoria horizontal de imputación supere el 100% para el período seleccionado.")
+    else:
+        st.warning(f"Se detectaron {len(sospechosos)} renglones para revisar. El control no agrupa movimientos: evalúa cada fila de manera independiente.")
+
+        if mes_auditoria == "Todos los meses":
+            resumen_mes = sospechosos.groupby("Mes", as_index=False).agg(
+                Renglones=("Suma imputación %", "size"),
+                Máximo=("Suma imputación %", "max"),
+            ).sort_values("Mes")
+            fig_auditoria = px.bar(
+                resumen_mes, x="Mes", y="Renglones", text="Renglones",
+                title="Renglones con imputación superior al 100% por mes",
+                color_discrete_sequence=["#C62828"],
+            )
+            fig_auditoria.update_traces(textposition="outside")
+            aplicar_estilo_figura(fig_auditoria, 330)
+            st.plotly_chart(fig_auditoria, use_container_width=True)
+
+        columnas_identificacion = [
+            "Fecha", "Mes", "Sucursal", "Cuenta:", "Nombre cuenta", "Nro.",
+            "Detalle", "des res", "Detalle 2", "Dpto", "Nombre del rubro",
+        ]
+        columnas_control = centros_auditoria + ["Suma imputación %", "Exceso %"]
+        detalle_auditoria = sospechosos[[c for c in columnas_identificacion + columnas_control if c in sospechosos.columns]].copy()
+
+        config_auditoria = {
+            c: st.column_config.NumberColumn(c, format="%.1f%%") for c in centros_auditoria
+        }
+        config_auditoria.update({
+            "Suma imputación %": st.column_config.NumberColumn("Suma imputación", format="%.1f%%"),
+            "Exceso %": st.column_config.NumberColumn("Exceso sobre 100%", format="%.1f%%"),
+        })
+        st.dataframe(
+            detalle_auditoria,
+            use_container_width=True,
+            height=560,
+            hide_index=True,
+            column_config=config_auditoria,
+        )
+        st.download_button(
+            "⬇️ Descargar renglones superiores al 100%",
+            data=detalle_auditoria.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"imputaciones_superiores_100_{mes_auditoria}.csv".replace(" ", "_"),
+            mime="text/csv",
+        )
+
+with tab12:
     st.subheader("⚙️ Diccionario y reglas del modelo")
     st.markdown("""
 ### P&L validado
