@@ -1886,61 +1886,65 @@ with tab11:
         ["Todos los meses"] + meses_auditoria,
         key="mes_auditoria_imputacion",
     )
-    base_auditoria = df_filtrado if mes_auditoria == "Todos los meses" else df_filtrado[df_filtrado["Mes"] == mes_auditoria]
-    sospechosos, centros_auditoria = auditar_imputacion_horizontal(base_auditoria)
-
-    a1, a2, a3 = st.columns(3)
-    a1.metric("Renglones revisados", f"{len(base_auditoria):,}".replace(",", "."))
-    a2.metric("Renglones superiores al 100%", f"{len(sospechosos):,}".replace(",", "."))
-    maximo_imputado = sospechosos["Suma imputación %"].max() if not sospechosos.empty else 0
-    a3.metric("Máxima imputación detectada", f"{maximo_imputado:.1f}%")
-
-    if sospechosos.empty:
-        st.success("No se encontraron renglones cuya sumatoria horizontal de imputación supere el 100% para el período seleccionado.")
+    ejecutar_auditoria = st.button("Analizar imputaciones Q:Z", key="ejecutar_auditoria_qz")
+    if not ejecutar_auditoria:
+        st.info("Seleccioná el mes y presioná **Analizar imputaciones Q:Z**. El control se ejecuta bajo demanda para no sobrecargar el tablero completo.")
     else:
-        st.warning(f"Se detectaron {len(sospechosos)} renglones para revisar. El control no agrupa movimientos: evalúa cada fila de manera independiente.")
+        base_auditoria = df_filtrado if mes_auditoria == "Todos los meses" else df_filtrado[df_filtrado["Mes"] == mes_auditoria]
+        sospechosos, centros_auditoria = auditar_imputacion_horizontal(base_auditoria)
 
-        if mes_auditoria == "Todos los meses":
-            resumen_mes = sospechosos.groupby("Mes", as_index=False).agg(
-                Renglones=("Suma imputación %", "size"),
-                Máximo=("Suma imputación %", "max"),
-            ).sort_values("Mes")
-            fig_auditoria = px.bar(
-                resumen_mes, x="Mes", y="Renglones", text="Renglones",
-                title="Renglones con imputación superior al 100% por mes",
-                color_discrete_sequence=["#C62828"],
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Renglones revisados", f"{len(base_auditoria):,}".replace(",", "."))
+        a2.metric("Renglones superiores al 100%", f"{len(sospechosos):,}".replace(",", "."))
+        maximo_imputado = sospechosos["Suma imputación %"].max() if not sospechosos.empty else 0
+        a3.metric("Máxima imputación detectada", f"{maximo_imputado:.1f}%")
+
+        if sospechosos.empty:
+            st.success("No se encontraron renglones cuya sumatoria horizontal de imputación supere el 100% para el período seleccionado.")
+        else:
+            st.warning(f"Se detectaron {len(sospechosos)} renglones para revisar. El control no agrupa movimientos: evalúa cada fila de manera independiente.")
+
+            if mes_auditoria == "Todos los meses":
+                resumen_mes = sospechosos.groupby("Mes", as_index=False).agg(
+                    Renglones=("Suma imputación %", "size"),
+                    Máximo=("Suma imputación %", "max"),
+                ).sort_values("Mes")
+                fig_auditoria = px.bar(
+                    resumen_mes, x="Mes", y="Renglones", text="Renglones",
+                    title="Renglones con imputación superior al 100% por mes",
+                    color_discrete_sequence=["#C62828"],
+                )
+                fig_auditoria.update_traces(textposition="outside")
+                aplicar_estilo_figura(fig_auditoria, 330)
+                st.plotly_chart(fig_auditoria, use_container_width=True)
+
+            columnas_identificacion = [
+                "Fecha", "Mes", "Sucursal", "Cuenta:", "Nombre cuenta", "Nro.",
+                "Detalle", "des res", "Detalle 2", "Dpto", "Nombre del rubro",
+            ]
+            columnas_control = centros_auditoria + ["Suma imputación %", "Exceso %"]
+            detalle_auditoria = sospechosos[[c for c in columnas_identificacion + columnas_control if c in sospechosos.columns]].copy()
+
+            config_auditoria = {
+                c: st.column_config.NumberColumn(c, format="%.1f%%") for c in centros_auditoria
+            }
+            config_auditoria.update({
+                "Suma imputación %": st.column_config.NumberColumn("Suma imputación", format="%.1f%%"),
+                "Exceso %": st.column_config.NumberColumn("Exceso sobre 100%", format="%.1f%%"),
+            })
+            st.dataframe(
+                detalle_auditoria,
+                use_container_width=True,
+                height=560,
+                hide_index=True,
+                column_config=config_auditoria,
             )
-            fig_auditoria.update_traces(textposition="outside")
-            aplicar_estilo_figura(fig_auditoria, 330)
-            st.plotly_chart(fig_auditoria, use_container_width=True)
-
-        columnas_identificacion = [
-            "Fecha", "Mes", "Sucursal", "Cuenta:", "Nombre cuenta", "Nro.",
-            "Detalle", "des res", "Detalle 2", "Dpto", "Nombre del rubro",
-        ]
-        columnas_control = centros_auditoria + ["Suma imputación %", "Exceso %"]
-        detalle_auditoria = sospechosos[[c for c in columnas_identificacion + columnas_control if c in sospechosos.columns]].copy()
-
-        config_auditoria = {
-            c: st.column_config.NumberColumn(c, format="%.1f%%") for c in centros_auditoria
-        }
-        config_auditoria.update({
-            "Suma imputación %": st.column_config.NumberColumn("Suma imputación", format="%.1f%%"),
-            "Exceso %": st.column_config.NumberColumn("Exceso sobre 100%", format="%.1f%%"),
-        })
-        st.dataframe(
-            detalle_auditoria,
-            use_container_width=True,
-            height=560,
-            hide_index=True,
-            column_config=config_auditoria,
-        )
-        st.download_button(
-            "⬇️ Descargar renglones superiores al 100%",
-            data=detalle_auditoria.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"imputaciones_superiores_100_{mes_auditoria}.csv".replace(" ", "_"),
-            mime="text/csv",
-        )
+            st.download_button(
+                "⬇️ Descargar renglones superiores al 100%",
+                data=detalle_auditoria.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"imputaciones_superiores_100_{mes_auditoria}.csv".replace(" ", "_"),
+                mime="text/csv",
+            )
 
 with tab12:
     st.subheader("⚙️ Diccionario y reglas del modelo")
