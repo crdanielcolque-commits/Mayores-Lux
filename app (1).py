@@ -17,7 +17,6 @@ CENTROS_POSVENTA = ["Repuestos", "Tl. Mec.", "Mayorista", "ChapyPintu"]
 # Se copian a campos internos al cargar la base para no confundirlas con
 # columnas posteriores que pueden repetir nombres y contener importes.
 IMPUTACION_PCT_ETIQUETAS = ["Vtas 0 Km", "Vtas Usado", "PPAA", "Repuestos", "Tl. Mec.", "KINTO", "Mayorista", "ChapyPintu", "Central", "Administr."]
-IMPUTACION_PCT_INTERNAS = [f"__Pct_QZ_{i}" for i in range(10)]
 
 SIGNO_RUBRO = {
     "VENTAS":"-", "INCENTIVOS":"-", "COMIS. P/VTA DIRECTA":"-", "INGRESO EXTRAORDIN":"-",
@@ -272,11 +271,6 @@ def campo_centros_gestion(df, centros_sel):
 def cargar_datos():
     df = pd.read_csv(CSV_URL)
     df.columns = [str(c).strip() for c in df.columns]
-    if len(df.columns) < 26:
-        raise ValueError("La base no contiene las columnas Q:Z requeridas para controlar la imputación.")
-    porcentajes_qz = df.iloc[:, 16:26].apply(pd.to_numeric, errors="coerce").fillna(0)
-    porcentajes_qz.columns = IMPUTACION_PCT_INTERNAS
-    df[IMPUTACION_PCT_INTERNAS] = porcentajes_qz
     if "Fecha" in df.columns:
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
         df["Mes"] = df["Fecha"].dt.to_period("M").astype(str)
@@ -319,18 +313,17 @@ def preparar_costos(df, centros_sel, grupos, meses):
 
 def auditar_imputacion_horizontal(df, tolerancia=0.0001):
     """Controla exclusivamente los porcentajes originales de las columnas Q:Z."""
-    campos = [c for c in IMPUTACION_PCT_INTERNAS if c in df.columns]
-    control = df.copy()
-    if len(campos) != 10:
-        control["Suma imputación %"] = 0.0
-        control["Exceso %"] = 0.0
-        return control.iloc[0:0], []
-    porcentajes = control[campos].apply(pd.to_numeric, errors="coerce").fillna(0)
-    for etiqueta, campo in zip(IMPUTACION_PCT_ETIQUETAS, campos):
-        control[f"Imputación · {etiqueta}"] = porcentajes[campo]
-    control["Suma imputación %"] = porcentajes.sum(axis=1)
+    if len(df.columns) < 26:
+        return df.iloc[0:0].copy(), []
+    porcentajes = df.iloc[:, 16:26].apply(pd.to_numeric, errors="coerce").fillna(0)
+    suma_imputacion = porcentajes.sum(axis=1)
+    mascara = suma_imputacion > 100 + tolerancia
+    control = df.loc[mascara].copy()
+    porcentajes_detectados = porcentajes.loc[mascara]
+    for posicion, etiqueta in enumerate(IMPUTACION_PCT_ETIQUETAS):
+        control[f"Imputación · {etiqueta}"] = porcentajes_detectados.iloc[:, posicion]
+    control["Suma imputación %"] = suma_imputacion.loc[mascara]
     control["Exceso %"] = control["Suma imputación %"] - 100
-    control = control[control["Suma imputación %"] > 100 + tolerancia].copy()
     columnas_mostrar = [f"Imputación · {x}" for x in IMPUTACION_PCT_ETIQUETAS]
     return control.sort_values(["Mes", "Suma imputación %"], ascending=[False, False]), columnas_mostrar
 
